@@ -1,0 +1,425 @@
+# Blue-Green Deployment Configuration
+# SRE Portfolio - CI/CD Pipeline Platform
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blue-green-deployment-config
+  namespace: ci-cd-platform
+  labels:
+    app: ci-cd-platform
+    component: deployment-strategy
+    strategy: blue-green
+data:
+  # Blue-Green deployment configuration
+  strategy_config.yaml: |
+    strategy:
+      name: blue-green
+      description: "Zero-downtime deployment using blue-green strategy"
+      
+      # Traffic routing configuration
+      traffic:
+        # Initial traffic split (100% to current/blue environment)
+        blue_weight: 100
+        green_weight: 0
+        
+        # Traffic switching strategy
+        switch_strategy: instant  # Options: instant, gradual
+        gradual_steps:
+          - duration: 5m
+            blue_weight: 0
+            green_weight: 100
+      
+      # Health check configuration
+      health_checks:
+        # Health check endpoint
+        endpoint: /health
+        path: /health/ready
+        port: 8080
+        scheme: HTTP
+        
+        # Health check parameters
+        initial_delay_seconds: 30
+        period_seconds: 10
+        timeout_seconds: 5
+        success_threshold: 3
+        failure_threshold: 3
+        
+        # Custom health checks
+        custom_checks:
+          - name: database_connectivity
+            type: tcp
+            host: postgres-service
+            port: 5432
+            timeout: 5s
+          
+          - name: cache_connectivity
+            type: tcp
+            host: redis-service
+            port: 6379
+            timeout: 3s
+          
+          - name: external_api
+            type: http
+            url: https://api.external.com/health
+            timeout: 10s
+            expected_status: 200
+      
+      # Deployment validation
+      validation:
+        # Pre-deployment checks
+        pre_deployment:
+          - check: resource_availability
+            cpu_threshold: 70
+            memory_threshold: 80
+          - check: cluster_health
+            min_ready_nodes: 2
+          - check: storage_capacity
+            min_free_space: 10GB
+        
+        # Post-deployment validation
+        post_deployment:
+          - check: response_time
+            max_latency: 500ms
+            percentile: 95
+          - check: error_rate
+            max_error_rate: 1
+            duration: 5m
+          - check: throughput
+            min_rps: 100
+            duration: 2m
+        
+        # Smoke tests
+        smoke_tests:
+          - name: login_flow
+            type: e2e
+            timeout: 60s
+          - name: api_endpoints
+            type: integration
+            timeout: 30s
+          - name: database_operations
+            type: unit
+            timeout: 15s
+      
+      # Rollback configuration
+      rollback:
+        # Automatic rollback triggers
+        auto_rollback: true
+        triggers:
+          - metric: error_rate
+            threshold: 5
+            duration: 2m
+          - metric: latency_p95
+            threshold: 1000ms
+            duration: 3m
+          - metric: availability
+            threshold: 99.5
+            duration: 5m
+        
+        # Rollback strategy
+        strategy: instant  # Options: instant, gradual
+        timeout: 10m
+        
+        # Rollback validation
+        validation:
+          health_checks: true
+          smoke_tests: true
+          performance_baseline: true
+      
+      # Monitoring and alerting
+      monitoring:
+        # Metrics to track during deployment
+        metrics:
+          - name: request_rate
+            source: prometheus
+            query: sum(rate(http_requests_total[5m]))
+          
+          - name: error_rate
+            source: prometheus
+            query: sum(rate(http_requests_total{status=~"5.."}[5m]))
+          
+          - name: response_time_p95
+            source: prometheus
+            query: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+          
+          - name: cpu_utilization
+            source: kubernetes
+            query: avg(container_cpu_usage_seconds_total)
+          
+          - name: memory_utilization
+            source: kubernetes
+            query: avg(container_memory_usage_bytes)
+        
+        # Alerting during deployment
+        alerts:
+          - name: deployment_failure
+            condition: error_rate > 5
+            severity: critical
+            channels: [slack, email, pagerduty]
+          
+          - name: high_latency
+            condition: response_time_p95 > 1000
+            severity: warning
+            channels: [slack]
+          
+          - name: deployment_stuck
+            condition: deployment_duration > 15m
+            severity: warning
+            channels: [slack, email]
+      
+      # Environment-specific overrides
+      environments:
+        dev:
+          health_checks:
+            initial_delay_seconds: 10
+            period_seconds: 5
+          rollback:
+            auto_rollback: false
+          validation:
+            post_deployment:
+              - check: response_time
+                max_latency: 1000ms
+        
+        staging:
+          traffic:
+            switch_strategy: gradual
+            gradual_steps:
+              - duration: 2m
+                blue_weight: 50
+                green_weight: 50
+              - duration: 3m
+                blue_weight: 0
+                green_weight: 100
+          monitoring:
+            metrics:
+              - name: business_metrics
+                source: custom
+                query: sum(user_signups_total)
+        
+        production:
+          validation:
+            pre_deployment:
+              - check: change_freeze
+                enabled: true
+              - check: approval_required
+                approvers: [sre-team, platform-team]
+            post_deployment:
+              - check: response_time
+                max_latency: 200ms
+                percentile: 99
+              - check: error_rate
+                max_error_rate: 0.1
+                duration: 10m
+          rollback:
+            triggers:
+              - metric: error_rate
+                threshold: 1
+                duration: 1m
+              - metric: latency_p99
+                threshold: 500ms
+                duration: 2m
+          monitoring:
+            alerts:
+              - name: production_deployment
+                condition: deployment_started
+                severity: info
+                channels: [slack, email, webhook]
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blue-green-scripts
+  namespace: ci-cd-platform
+  labels:
+    app: ci-cd-platform
+    component: deployment-scripts
+data:
+  deploy.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    # Blue-Green Deployment Script
+    # Usage: ./deploy.sh <environment> <version>
+    
+    ENVIRONMENT=${1:-dev}
+    VERSION=${2:-latest}
+    NAMESPACE="ci-cd-platform-${ENVIRONMENT}"
+    
+    echo "🚀 Starting blue-green deployment..."
+    echo "Environment: ${ENVIRONMENT}"
+    echo "Version: ${VERSION}"
+    echo "Namespace: ${NAMESPACE}"
+    
+    # Determine current active deployment (blue or green)
+    CURRENT_COLOR=$(kubectl get service ci-cd-platform-active -n ${NAMESPACE} \
+      -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+    
+    if [[ "${CURRENT_COLOR}" == "blue" ]]; then
+      NEW_COLOR="green"
+    else
+      NEW_COLOR="blue"
+    fi
+    
+    echo "Current active: ${CURRENT_COLOR}"
+    echo "Deploying to: ${NEW_COLOR}"
+    
+    # Deploy new version to inactive environment
+    echo "📦 Deploying ${VERSION} to ${NEW_COLOR} environment..."
+    kubectl set image deployment/ci-cd-platform-${NEW_COLOR} \
+      app=ghcr.io/sre-portfolio/ci-cd-platform:${VERSION} \
+      -n ${NAMESPACE}
+    
+    # Wait for rollout to complete
+    echo "⏳ Waiting for rollout to complete..."
+    kubectl rollout status deployment/ci-cd-platform-${NEW_COLOR} \
+      -n ${NAMESPACE} --timeout=600s
+    
+    # Run health checks
+    echo "🔍 Running health checks..."
+    ./health-check.sh ${ENVIRONMENT} ${NEW_COLOR}
+    
+    # Run smoke tests
+    echo "🧪 Running smoke tests..."
+    ./smoke-test.sh ${ENVIRONMENT} ${NEW_COLOR}
+    
+    # Switch traffic to new deployment
+    echo "🔀 Switching traffic to ${NEW_COLOR}..."
+    kubectl patch service ci-cd-platform-active \
+      -n ${NAMESPACE} \
+      -p '{"spec":{"selector":{"color":"'${NEW_COLOR}'"}}}'
+    
+    # Verify traffic switch
+    sleep 10
+    ./verify-traffic.sh ${ENVIRONMENT} ${NEW_COLOR}
+    
+    # Final validation
+    echo "✅ Running final validation..."
+    ./post-deployment-validation.sh ${ENVIRONMENT} ${NEW_COLOR}
+    
+    echo "🎉 Blue-green deployment completed successfully!"
+    echo "Active environment: ${NEW_COLOR}"
+    echo "Previous environment: ${CURRENT_COLOR} (ready for cleanup)"
+
+  health-check.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    ENVIRONMENT=${1:-dev}
+    COLOR=${2:-blue}
+    NAMESPACE="ci-cd-platform-${ENVIRONMENT}"
+    SERVICE_NAME="ci-cd-platform-${COLOR}"
+    
+    echo "🔍 Running health checks for ${COLOR} deployment..."
+    
+    # Get service endpoint
+    SERVICE_IP=$(kubectl get service ${SERVICE_NAME} -n ${NAMESPACE} \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || \
+      kubectl get service ${SERVICE_NAME} -n ${NAMESPACE} \
+      -o jsonpath='{.spec.clusterIP}')
+    
+    SERVICE_PORT=$(kubectl get service ${SERVICE_NAME} -n ${NAMESPACE} \
+      -o jsonpath='{.spec.ports[0].port}')
+    
+    ENDPOINT="http://${SERVICE_IP}:${SERVICE_PORT}"
+    
+    # Health check endpoint
+    echo "Checking health endpoint: ${ENDPOINT}/health"
+    for i in {1..30}; do
+      if curl -f -s "${ENDPOINT}/health" > /dev/null; then
+        echo "✅ Health check passed"
+        break
+      fi
+      if [[ $i -eq 30 ]]; then
+        echo "❌ Health check failed after 30 attempts"
+        exit 1
+      fi
+      echo "Health check attempt $i/30 failed, retrying in 10s..."
+      sleep 10
+    done
+    
+    # Ready check endpoint
+    echo "Checking ready endpoint: ${ENDPOINT}/ready"
+    if curl -f -s "${ENDPOINT}/ready" | jq -e '.status == "ready"' > /dev/null; then
+      echo "✅ Ready check passed"
+    else
+      echo "❌ Ready check failed"
+      exit 1
+    fi
+    
+    # Database connectivity check
+    echo "Checking database connectivity..."
+    if curl -f -s "${ENDPOINT}/health/db" | jq -e '.database.connected == true' > /dev/null; then
+      echo "✅ Database connectivity check passed"
+    else
+      echo "❌ Database connectivity check failed"
+      exit 1
+    fi
+    
+    echo "🎉 All health checks passed for ${COLOR} deployment!"
+
+  rollback.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    ENVIRONMENT=${1:-dev}
+    NAMESPACE="ci-cd-platform-${ENVIRONMENT}"
+    
+    echo "🔄 Starting rollback process..."
+    
+    # Get current active color
+    CURRENT_COLOR=$(kubectl get service ci-cd-platform-active -n ${NAMESPACE} \
+      -o jsonpath='{.spec.selector.color}')
+    
+    # Determine rollback color
+    if [[ "${CURRENT_COLOR}" == "blue" ]]; then
+      ROLLBACK_COLOR="green"
+    else
+      ROLLBACK_COLOR="blue"
+    fi
+    
+    echo "Current active: ${CURRENT_COLOR}"
+    echo "Rolling back to: ${ROLLBACK_COLOR}"
+    
+    # Verify rollback target is healthy
+    echo "🔍 Verifying rollback target health..."
+    ./health-check.sh ${ENVIRONMENT} ${ROLLBACK_COLOR}
+    
+    # Switch traffic back
+    echo "🔀 Switching traffic to ${ROLLBACK_COLOR}..."
+    kubectl patch service ci-cd-platform-active \
+      -n ${NAMESPACE} \
+      -p '{"spec":{"selector":{"color":"'${ROLLBACK_COLOR}'"}}}'
+    
+    # Verify rollback
+    sleep 10
+    ./verify-traffic.sh ${ENVIRONMENT} ${ROLLBACK_COLOR}
+    
+    echo "✅ Rollback completed successfully!"
+    echo "Active environment: ${ROLLBACK_COLOR}"
+
+  cleanup.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    ENVIRONMENT=${1:-dev}
+    NAMESPACE="ci-cd-platform-${ENVIRONMENT}"
+    
+    # Get current active color
+    ACTIVE_COLOR=$(kubectl get service ci-cd-platform-active -n ${NAMESPACE} \
+      -o jsonpath='{.spec.selector.color}')
+    
+    # Determine inactive color
+    if [[ "${ACTIVE_COLOR}" == "blue" ]]; then
+      INACTIVE_COLOR="green"
+    else
+      INACTIVE_COLOR="blue"
+    fi
+    
+    echo "🧹 Cleaning up inactive deployment: ${INACTIVE_COLOR}"
+    
+    # Scale down inactive deployment
+    kubectl scale deployment ci-cd-platform-${INACTIVE_COLOR} \
+      --replicas=0 -n ${NAMESPACE}
+    
+    echo "✅ Cleanup completed for ${INACTIVE_COLOR} deployment"

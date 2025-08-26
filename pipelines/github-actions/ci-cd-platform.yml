@@ -1,0 +1,646 @@
+name: Advanced CI/CD Platform Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'feature/*', 'hotfix/*']
+    tags: ['v*']
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+  # Manual workflow dispatch with advanced options
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: ['dev', 'staging', 'production']
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'rolling'
+        type: choice
+        options: ['rolling', 'blue-green', 'canary']
+      skip_tests:
+        description: 'Skip test execution'
+        required: false
+        default: false
+        type: boolean
+      force_deploy:
+        description: 'Force deployment (skip quality gates)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: sre-portfolio/ci-cd-platform
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.11'
+  GO_VERSION: '1.21'
+
+# Global permissions for OIDC token
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+  pull-requests: write
+  security-events: write
+  actions: read
+
+jobs:
+  # ==============================================================================
+  # Pipeline Setup and Context
+  # ==============================================================================
+  
+  pipeline-context:
+    name: Pipeline Context
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short-sha: ${{ steps.version.outputs.short-sha }}
+      environment: ${{ steps.env.outputs.environment }}
+      deployment-strategy: ${{ steps.env.outputs.deployment-strategy }}
+      should-deploy: ${{ steps.env.outputs.should-deploy }}
+      skip-tests: ${{ steps.env.outputs.skip-tests }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION="$(git describe --tags --always --dirty)-${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short-sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Determine environment and deployment strategy
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            STRATEGY="${{ github.event.inputs.deployment_strategy }}"
+            SKIP_TESTS="${{ github.event.inputs.skip_tests }}"
+            SHOULD_DEPLOY="true"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENVIRONMENT="staging"
+            STRATEGY="rolling"
+            SKIP_TESTS="false"
+            SHOULD_DEPLOY="true"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            ENVIRONMENT="dev"
+            STRATEGY="rolling"
+            SKIP_TESTS="false"
+            SHOULD_DEPLOY="true"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            ENVIRONMENT="production"
+            STRATEGY="blue-green"
+            SKIP_TESTS="false"
+            SHOULD_DEPLOY="true"
+          else
+            ENVIRONMENT="dev"
+            STRATEGY="rolling"
+            SKIP_TESTS="false"
+            SHOULD_DEPLOY="false"
+          fi
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "deployment-strategy=$STRATEGY" >> $GITHUB_OUTPUT
+          echo "should-deploy=$SHOULD_DEPLOY" >> $GITHUB_OUTPUT
+          echo "skip-tests=$SKIP_TESTS" >> $GITHUB_OUTPUT
+
+      - name: Generate test matrix
+        id: matrix
+        run: |
+          MATRIX='{"include":[
+            {"os":"ubuntu-latest","node":"18","python":"3.11"},
+            {"os":"ubuntu-latest","node":"20","python":"3.12"}
+          ]}'
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  # ==============================================================================
+  # Code Quality and Security Checks
+  # ==============================================================================
+
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: pipeline-context
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+        continue-on-error: false
+
+      - name: Run Prettier check
+        run: npm run format:check
+
+      - name: Run TypeScript compiler
+        run: npm run type-check
+
+      - name: Upload ESLint results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: eslint-results.sarif
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: pipeline-context
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Run npm audit
+        run: npm audit --audit-level moderate
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'ci-cd-platform'
+          path: '.'
+          format: 'SARIF'
+          out: 'dependency-check-results.sarif'
+
+      - name: Upload OWASP results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'dependency-check-results.sarif'
+
+  # ==============================================================================
+  # Comprehensive Testing
+  # ==============================================================================
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ${{ matrix.os }}
+    needs: [pipeline-context, code-quality]
+    if: needs.pipeline-context.outputs.skip-tests != 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.pipeline-context.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          pip install -r requirements-test.txt
+
+      - name: Run JavaScript/TypeScript tests
+        run: npm run test:unit -- --coverage --reporters=default --reporters=jest-junit
+        env:
+          JEST_JUNIT_OUTPUT_DIR: ./test-results
+          JEST_JUNIT_OUTPUT_NAME: jest-results.xml
+
+      - name: Run Python tests
+        run: |
+          python -m pytest tests/unit/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=html \
+            --junit-xml=test-results/pytest-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.python }}
+          path: test-results/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unit-tests
+          name: codecov-${{ matrix.os }}-${{ matrix.node }}
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, unit-tests]
+    if: needs.pipeline-context.outputs.skip-tests != 'true'
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup test environment
+        run: |
+          cp .env.test.example .env.test
+          npm run db:migrate
+          npm run db:seed
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: integration-test-results
+          path: test-results/
+
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, integration-tests]
+    if: needs.pipeline-context.outputs.skip-tests != 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install K6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Run performance tests
+        run: |
+          npm run start:test &
+          sleep 30
+          k6 run --out json=performance-results.json tests/performance/load-test.js
+          k6 run --out json=stress-results.json tests/performance/stress-test.js
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: performance-test-results
+          path: |
+            performance-results.json
+            stress-results.json
+
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, integration-tests]
+    if: needs.pipeline-context.outputs.skip-tests != 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          CI: true
+
+      - name: Upload E2E results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: e2e-test-results
+          path: |
+            test-results/
+            playwright-report/
+
+  # ==============================================================================
+  # Build and Package
+  # ==============================================================================
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, code-quality, security-scan]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: |
+          npm run build
+          npm run build:docs
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.pipeline-context.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.pipeline-context.outputs.version }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.pipeline-context.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+  # ==============================================================================
+  # Deployment
+  # ==============================================================================
+
+  deploy:
+    name: Deploy (${{ needs.pipeline-context.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, build, unit-tests, integration-tests]
+    if: needs.pipeline-context.outputs.should-deploy == 'true'
+    environment:
+      name: ${{ needs.pipeline-context.outputs.environment }}
+      url: ${{ steps.deploy.outputs.url }}
+    concurrency:
+      group: deploy-${{ needs.pipeline-context.outputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-deploy
+          aws-region: us-west-2
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: '1.28.0'
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region us-west-2 \
+            --name sre-portfolio-${{ needs.pipeline-context.outputs.environment }}-eks
+
+      - name: Deploy with strategy
+        id: deploy
+        run: |
+          STRATEGY="${{ needs.pipeline-context.outputs.deployment-strategy }}"
+          VERSION="${{ needs.pipeline-context.outputs.version }}"
+          ENVIRONMENT="${{ needs.pipeline-context.outputs.environment }}"
+          
+          case $STRATEGY in
+            "blue-green")
+              ./deployment-strategies/blue-green/deploy.sh $ENVIRONMENT $VERSION
+              ;;
+            "canary")
+              ./deployment-strategies/canary/deploy.sh $ENVIRONMENT $VERSION
+              ;;
+            "rolling")
+              ./deployment-strategies/rolling/deploy.sh $ENVIRONMENT $VERSION
+              ;;
+            *)
+              echo "Unknown deployment strategy: $STRATEGY"
+              exit 1
+              ;;
+          esac
+          
+          # Get application URL
+          URL=$(kubectl get ingress ci-cd-platform -n ci-cd-platform-$ENVIRONMENT -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "")
+          echo "url=https://$URL" >> $GITHUB_OUTPUT
+
+      - name: Run health checks
+        run: |
+          ./monitoring/health-checks/check-health.sh ${{ needs.pipeline-context.outputs.environment }}
+
+      - name: Run smoke tests
+        run: |
+          npm run test:smoke -- --environment=${{ needs.pipeline-context.outputs.environment }}
+
+  # ==============================================================================
+  # Post-Deployment
+  # ==============================================================================
+
+  post-deployment:
+    name: Post-Deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, deploy]
+    if: always() && needs.deploy.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Update deployment status
+        run: |
+          echo "Deployment completed successfully"
+          echo "Environment: ${{ needs.pipeline-context.outputs.environment }}"
+          echo "Version: ${{ needs.pipeline-context.outputs.version }}"
+          echo "Strategy: ${{ needs.pipeline-context.outputs.deployment-strategy }}"
+
+      - name: Generate deployment report
+        run: |
+          ./tools/scripts/deployment-report.sh \
+            ${{ needs.pipeline-context.outputs.environment }} \
+            ${{ needs.pipeline-context.outputs.version }}
+
+      - name: Update DORA metrics
+        run: |
+          ./monitoring/metrics/update-dora-metrics.sh \
+            ${{ needs.pipeline-context.outputs.environment }} \
+            ${{ github.sha }} \
+            ${{ github.event.head_commit.timestamp }}
+
+  # ==============================================================================
+  # Notifications and Cleanup
+  # ==============================================================================
+
+  notify:
+    name: Notify Teams
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, deploy, post-deployment]
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          text: |
+            🚀 Deployment Status: ${{ needs.deploy.result }}
+            
+            📦 Version: ${{ needs.pipeline-context.outputs.version }}
+            🌍 Environment: ${{ needs.pipeline-context.outputs.environment }}
+            📊 Strategy: ${{ needs.pipeline-context.outputs.deployment-strategy }}
+            
+            🔗 View Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Create GitHub deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deploymentId = context.payload.deployment?.id;
+            if (deploymentId) {
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: deploymentId,
+                state: '${{ needs.deploy.result }}' === 'success' ? 'success' : 'failure',
+                description: 'Deployment ${{ needs.deploy.result }}',
+                environment_url: '${{ needs.deploy.outputs.url }}'
+              });
+            }
+
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [pipeline-context, deploy, post-deployment]
+    if: always()
+    steps:
+      - name: Cleanup old artifacts
+        run: |
+          echo "Cleaning up old artifacts and temporary resources..."
+          # Cleanup logic here
+
+      - name: Update pipeline metrics
+        run: |
+          echo "Updating pipeline success metrics..."
+          # Metrics update logic here
