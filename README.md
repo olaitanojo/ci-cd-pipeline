@@ -502,3 +502,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Issues**: [GitHub Issues](../../issues)
 - **Discussions**: [GitHub Discussions](../../discussions)
 - **Security**: [Security Policy](SECURITY.md)
+
+---
+
+**Created by [olaitanojo](https://github.com/olaitanojo)**
