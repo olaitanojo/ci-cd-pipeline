@@ -1,0 +1,569 @@
+name: Naira Remit App CI/CD
+
+on:
+  push:
+    branches: [ main, develop, staging ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'blue-green'
+        type: choice
+        options:
+          - blue-green
+          - canary
+          - rolling
+
+env:
+  REGISTRY: nairaremitregistry.azurecr.io
+  IMAGE_NAME: naira-remit-app
+  NODE_VERSION: '18'
+
+jobs:
+  setup:
+    name: Setup and Validate
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deployment_strategy: ${{ steps.set-strategy.outputs.strategy }}
+      should_deploy: ${{ steps.set-deploy.outputs.should_deploy }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Environment
+        id: set-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set Deployment Strategy
+        id: set-strategy
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "strategy=${{ github.event.inputs.deployment_strategy }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.set-env.outputs.environment }}" == "production" ]]; then
+            echo "strategy=blue-green" >> $GITHUB_OUTPUT
+          else
+            echo "strategy=rolling" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set Deployment Flag
+        id: set-deploy
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          fi
+
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          npm ci
+          npm install -g eslint prettier audit-ci
+
+      - name: Code Formatting Check
+        run: |
+          prettier --check "src/**/*.{js,ts,json}"
+          prettier --check "tests/**/*.{js,ts,json}"
+
+      - name: Linting
+        run: |
+          eslint src/ tests/ --ext .js,.ts --format json --output-file eslint-report.json || true
+          eslint src/ tests/ --ext .js,.ts
+
+      - name: Type Checking (if TypeScript)
+        run: |
+          if [ -f tsconfig.json ]; then
+            npx tsc --noEmit
+          fi
+
+      - name: Security Audit
+        run: |
+          npm audit --audit-level=high --json > npm-audit.json || true
+          audit-ci --config audit-ci.json
+
+      - name: Upload Code Quality Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: code-quality-reports
+          path: |
+            eslint-report.json
+            npm-audit.json
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-type: [unit, integration, e2e]
+    
+    services:
+      mongodb:
+        image: mongo:5.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: admin
+          MONGO_INITDB_ROOT_PASSWORD: password
+        options: >-
+          --health-cmd mongo
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 27017:27017
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Unit Tests
+        if: matrix.test-type == 'unit'
+        run: |
+          npm run test:unit -- --coverage --reporter=json --outputFile=unit-test-results.json
+
+      - name: Run Integration Tests
+        if: matrix.test-type == 'integration'
+        env:
+          MONGODB_URI: mongodb://admin:password@localhost:27017/naira_remit_test?authSource=admin
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+        run: |
+          npm run test:integration -- --reporter=json --outputFile=integration-test-results.json
+
+      - name: Run E2E Tests
+        if: matrix.test-type == 'e2e'
+        env:
+          MONGODB_URI: mongodb://admin:password@localhost:27017/naira_remit_e2e?authSource=admin
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+        run: |
+          npm run test:e2e -- --reporter=json --outputFile=e2e-test-results.json
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.test-type }}
+          path: |
+            *-test-results.json
+            coverage/
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Snyk Security Scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'naira-remit-app'
+          path: '.'
+          format: 'JSON'
+          out: 'dependency-check-reports'
+
+      - name: Upload Dependency Check Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-results
+          path: dependency-check-reports/
+
+  build-and-push:
+    name: Build and Push Container
+    runs-on: ubuntu-latest
+    needs: [setup, code-quality, test, security-scan]
+    if: needs.setup.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and Push Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            BUILD_DATE=${{ steps.meta.outputs.labels }}
+
+      - name: Scan Container Image
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --format sarif --output container-scan.sarif \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Upload Container Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: container-scan-results
+          path: container-scan.sarif
+
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: [setup, build-and-push]
+    if: needs.setup.outputs.should_deploy == 'true'
+    environment: 
+      name: ${{ needs.setup.outputs.environment }}
+      url: ${{ steps.get-url.outputs.app_url }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} --name ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Deploy with Blue-Green Strategy
+        if: needs.setup.outputs.deployment_strategy == 'blue-green'
+        run: |
+          echo "Deploying with Blue-Green strategy..."
+          # Update image tag
+          sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|" k8s/base/deployment.yaml
+          
+          # Apply blue-green deployment
+          kubectl apply -f k8s/overlays/${{ needs.setup.outputs.environment }}/
+          
+          # Wait for deployment validation
+          kubectl wait --for=condition=available deployment/naira-remit-app-preview \
+            -n naira-remit-${{ needs.setup.outputs.environment }} --timeout=600s
+          
+          # Run validation tests on preview environment
+          python scripts/validation_tests.py --environment ${{ needs.setup.outputs.environment }} --service preview
+          
+          # Promote after validation (manual approval required for production)
+          if [[ "${{ needs.setup.outputs.environment }}" != "production" ]]; then
+            kubectl argo rollouts promote naira-remit-app -n naira-remit-${{ needs.setup.outputs.environment }}
+          fi
+
+      - name: Deploy with Canary Strategy
+        if: needs.setup.outputs.deployment_strategy == 'canary'
+        run: |
+          echo "Deploying with Canary strategy..."
+          # Update image tag
+          sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|" k8s/base/deployment.yaml
+          
+          # Apply canary deployment
+          kubectl apply -f k8s/overlays/${{ needs.setup.outputs.environment }}/
+          
+          # Monitor canary deployment
+          kubectl argo rollouts get rollout naira-remit-app -n naira-remit-${{ needs.setup.outputs.environment }} -w
+
+      - name: Deploy with Rolling Strategy
+        if: needs.setup.outputs.deployment_strategy == 'rolling'
+        run: |
+          echo "Deploying with Rolling Update strategy..."
+          kubectl set image deployment/naira-remit-app \
+            naira-remit-app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n naira-remit-${{ needs.setup.outputs.environment }}
+          
+          kubectl rollout status deployment/naira-remit-app -n naira-remit-${{ needs.setup.outputs.environment }}
+
+      - name: Run Post-Deployment Tests
+        run: |
+          echo "Running post-deployment validation..."
+          # Health check
+          kubectl get pods -n naira-remit-${{ needs.setup.outputs.environment }}
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod -l app=naira-remit-app \
+            -n naira-remit-${{ needs.setup.outputs.environment }} --timeout=300s
+          
+          # Run comprehensive tests
+          npm run test:smoke -- --environment ${{ needs.setup.outputs.environment }}
+          python scripts/transaction_validation.py --environment ${{ needs.setup.outputs.environment }}
+
+      - name: Get Application URL
+        id: get-url
+        run: |
+          APP_URL=$(kubectl get ingress naira-remit-app -n naira-remit-${{ needs.setup.outputs.environment }} \
+            -o jsonpath='{.spec.rules[0].host}')
+          echo "app_url=https://$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Update Feature Flags
+        if: needs.setup.outputs.environment == 'production'
+        run: |
+          echo "Updating feature flags for production deployment..."
+          # Gradual feature rollout for remittance services
+          node scripts/update-feature-flags.js --environment production --deployment-id ${{ github.sha }}
+
+  compliance-check:
+    name: Compliance and Security Validation
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+    if: needs.setup.outputs.should_deploy == 'true' && needs.setup.outputs.environment == 'production'
+    
+    steps:
+      - name: PCI DSS Compliance Check
+        run: |
+          echo "Running PCI DSS compliance validation..."
+          # Validate encryption in transit and at rest
+          python scripts/pci_compliance_check.py --environment production
+
+      - name: AML/KYC Validation
+        run: |
+          echo "Validating AML/KYC processes..."
+          # Ensure compliance with financial regulations
+          python scripts/aml_kyc_validation.py --environment production
+
+      - name: Data Protection Validation
+        run: |
+          echo "Validating data protection measures..."
+          # Check GDPR/CCPA compliance
+          python scripts/data_protection_check.py --environment production
+
+  monitoring:
+    name: Update Monitoring
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+    if: needs.setup.outputs.should_deploy == 'true' && always() && needs.deploy.result == 'success'
+    
+    steps:
+      - name: Update Grafana Dashboards
+        run: |
+          echo "Updating Grafana dashboards..."
+          curl -X POST "${{ secrets.GRAFANA_URL }}/api/dashboards/db" \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @monitoring/grafana/naira-remit-dashboard.json
+
+      - name: Setup Transaction Monitoring
+        run: |
+          echo "Setting up transaction monitoring alerts..."
+          # Configure alerts for transaction failures, high volumes, etc.
+          python scripts/setup_transaction_alerts.py --environment ${{ needs.setup.outputs.environment }}
+
+      - name: Create Deployment Event
+        run: |
+          echo "Creating deployment event..."
+          curl -X POST "${{ secrets.PROMETHEUS_PUSHGATEWAY_URL }}/metrics/job/github-actions" \
+            -d "deployment_info{environment=\"${{ needs.setup.outputs.environment }}\",service=\"naira-remit\",commit=\"${{ github.sha }}\"} 1"
+
+  notification:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, compliance-check]
+    if: always() && needs.setup.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Notify Slack on Success
+        if: needs.deploy.result == 'success' && (needs.compliance-check.result == 'success' || needs.compliance-check.result == 'skipped')
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          channel: '#remittance-deployments'
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify Compliance Team
+        if: needs.setup.outputs.environment == 'production' && needs.deploy.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              channel: '#compliance-notifications',
+              attachments: [{
+                color: 'good',
+                title: 'Production Deployment - Compliance Review Required',
+                text: 'Naira Remit App has been deployed to production. Please review compliance status.',
+                fields: [
+                  { title: 'Environment', value: '${{ needs.setup.outputs.environment }}', short: true },
+                  { title: 'Strategy', value: '${{ needs.setup.outputs.deployment_strategy }}', short: true },
+                  { title: 'Commit', value: '${{ github.sha }}', short: true }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.COMPLIANCE_SLACK_WEBHOOK }}
+
+      - name: Notify on Failure
+        if: needs.deploy.result == 'failure' || needs.compliance-check.result == 'failure'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          channel: '#remittance-deployments'
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, compliance-check]
+    if: failure() && needs.setup.outputs.environment == 'production' && needs.setup.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} --name ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Rollback Deployment
+        run: |
+          echo "Rolling back production deployment..."
+          if [[ "${{ needs.setup.outputs.deployment_strategy }}" == "blue-green" ]]; then
+            kubectl argo rollouts abort naira-remit-app -n naira-remit-production
+            kubectl argo rollouts undo naira-remit-app -n naira-remit-production
+          elif [[ "${{ needs.setup.outputs.deployment_strategy }}" == "canary" ]]; then
+            kubectl argo rollouts abort naira-remit-app -n naira-remit-production
+            kubectl argo rollouts undo naira-remit-app -n naira-remit-production
+          else
+            kubectl rollout undo deployment/naira-remit-app -n naira-remit-production
+          fi
+
+      - name: Verify Rollback
+        run: |
+          kubectl rollout status deployment/naira-remit-app -n naira-remit-production --timeout=300s
+          kubectl get pods -n naira-remit-production
+
+      - name: Emergency Notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              channel: '#remittance-emergency',
+              attachments: [{
+                color: 'danger',
+                title: '🚨 PRODUCTION ROLLBACK COMPLETED',
+                text: 'Emergency rollback completed for Naira Remit App due to deployment failure.',
+                fields: [
+                  { title: 'Environment', value: 'production', short: true },
+                  { title: 'Rollback Reason', value: 'Deployment/Compliance Failure', short: true },
+                  { title: 'Action Required', value: 'Immediate investigation needed', short: false }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.EMERGENCY_SLACK_WEBHOOK }}
