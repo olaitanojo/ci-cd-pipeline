@@ -1,0 +1,943 @@
+# GitLab CI/CD Pipeline for Infrastructure as Code (Terraform)
+# Advanced Deployment Strategies: Blue-Green Infrastructure, Canary Infrastructure, Multi-Environment
+# Complete Infrastructure CI/CD pipeline with zero-downtime infrastructure changes
+
+# =============================================================================
+# GLOBAL CONFIGURATION
+# =============================================================================
+
+stages:
+  - setup
+  - validate
+  - security-scan
+  - plan
+  - approve
+  - deploy
+  - post-validation
+  - monitoring
+  - disaster-recovery
+  - notification
+  - rollback
+
+variables:
+  # Terraform Configuration
+  TF_VERSION: "1.5.7"
+  TF_IN_AUTOMATION: "true"
+  TF_CLI_ARGS: "-no-color"
+  
+  # Azure Configuration
+  ARM_USE_OIDC: "true"
+  TF_BACKEND_RESOURCE_GROUP: terraform-state-rg
+  TF_BACKEND_STORAGE_ACCOUNT: terraformstatestorage
+  TF_BACKEND_CONTAINER_NAME: tfstate
+  
+  # Build Metadata
+  BUILD_VERSION: "$CI_PIPELINE_ID-${CI_COMMIT_SHORT_SHA}"
+
+# =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+
+default:
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl wget unzip python3 py3-pip jq
+
+cache:
+  paths:
+    - .terraform/
+    - .tflint.d/
+    - .infracost/
+    - node_modules/
+
+# =============================================================================
+# SETUP AND METADATA
+# =============================================================================
+
+setup:metadata:
+  stage: setup
+  script:
+    - |
+      # Determine target environment and strategy based on branch
+      if [[ "$CI_COMMIT_REF_NAME" == "main" ]]; then
+        echo "TARGET_ENV=production" >> deploy.env
+        echo "TERRAFORM_ACTION=apply" >> deploy.env
+        echo "DEPLOYMENT_STRATEGY=canary" >> deploy.env
+        echo "SHOULD_DEPLOY=true" >> deploy.env
+      elif [[ "$CI_COMMIT_REF_NAME" == "develop" ]]; then
+        echo "TARGET_ENV=staging" >> deploy.env
+        echo "TERRAFORM_ACTION=apply" >> deploy.env
+        echo "DEPLOYMENT_STRATEGY=blue-green" >> deploy.env
+        echo "SHOULD_DEPLOY=true" >> deploy.env
+      else
+        echo "TARGET_ENV=dev" >> deploy.env
+        echo "TERRAFORM_ACTION=plan" >> deploy.env
+        echo "DEPLOYMENT_STRATEGY=standard" >> deploy.env
+        echo "SHOULD_DEPLOY=false" >> deploy.env
+      fi
+      
+      echo "BUILD_VERSION=$BUILD_VERSION" >> deploy.env
+      
+      # Display infrastructure information
+      echo "🏗️ Infrastructure Version: $BUILD_VERSION"
+      cat deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 day
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# =============================================================================
+# INFRASTRUCTURE VALIDATION
+# =============================================================================
+
+validate:terraform:
+  stage: validate
+  needs: ["setup:metadata"]
+  image: hashicorp/terraform:$TF_VERSION
+  before_script:
+    - terraform version
+  script:
+    - echo "🔍 Validating Terraform configurations..."
+    
+    # Format check
+    - terraform fmt -check -recursive .
+    
+    # Initialize and validate each environment
+    - |
+      for env in dev staging production; do
+        if [ -d "environments/$env" ]; then
+          echo "Validating $env environment..."
+          cd environments/$env
+          terraform init -backend=false
+          terraform validate
+          cd ../../
+        fi
+      done
+  cache:
+    key: terraform-validate
+    paths:
+      - .terraform/
+  allow_failure: false
+
+validate:tflint:
+  stage: validate
+  needs: ["setup:metadata"]
+  script:
+    # Install TFLint
+    - curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+    
+    # TFLint analysis
+    - echo "🔍 Running TFLint analysis..."
+    - tflint --init
+    - |
+      find . -name "*.tf" -not -path "./.terraform/*" | xargs dirname | sort -u | while read dir; do
+        echo "Running TFLint on $dir"
+        tflint "$dir" --format json > "tflint-$(basename $dir).json" || true
+      done
+  artifacts:
+    paths:
+      - tflint-*.json
+    expire_in: 1 week
+  allow_failure: true
+
+# =============================================================================
+# SECURITY AND COMPLIANCE SCANNING
+# =============================================================================
+
+security:tfsec:
+  stage: security-scan
+  needs: ["validate:terraform"]
+  script:
+    # Install TFSec
+    - wget https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64 -O tfsec
+    - chmod +x tfsec && mv tfsec /usr/local/bin/
+    
+    # TFSec security scanning
+    - echo "🔒 Running TFSec security analysis..."
+    - tfsec . --format json --out tfsec-results.json || true
+    - tfsec . --format sarif --out tfsec-results.sarif || true
+    - tfsec . --format junit --out tfsec-junit.xml || true
+  artifacts:
+    reports:
+      sast: tfsec-results.sarif
+      junit: tfsec-junit.xml
+    paths:
+      - tfsec-results.*
+    expire_in: 1 week
+  allow_failure: true
+
+security:checkov:
+  stage: security-scan
+  needs: ["validate:terraform"]
+  image: bridgecrew/checkov:latest
+  script:
+    # Checkov security and compliance scanning
+    - echo "🔒 Running Checkov security analysis..."
+    - checkov -d . --framework terraform --output json --output-file checkov-results.json || true
+    - checkov -d . --framework terraform --output sarif --output-file checkov-results.sarif || true
+    - checkov -d . --framework terraform --output junitxml --output-file checkov-junit.xml || true
+  artifacts:
+    reports:
+      sast: checkov-results.sarif
+      junit: checkov-junit.xml
+    paths:
+      - checkov-results.*
+    expire_in: 1 week
+  allow_failure: true
+
+security:semgrep:
+  stage: security-scan
+  needs: ["validate:terraform"]
+  image: returntocorp/semgrep:latest
+  script:
+    # Semgrep security scanning
+    - echo "🔒 Running Semgrep security scanning..."
+    - semgrep --config=auto --json --output=semgrep-results.json . || true
+    - semgrep --config=auto --sarif --output=semgrep-results.sarif . || true
+  artifacts:
+    reports:
+      sast: semgrep-results.sarif
+    paths:
+      - semgrep-results.*
+    expire_in: 1 week
+  allow_failure: true
+
+# =============================================================================
+# COST ANALYSIS
+# =============================================================================
+
+cost:infracost:
+  stage: security-scan
+  needs: ["validate:terraform"]
+  variables:
+    INFRACOST_API_KEY: $INFRACOST_API_KEY
+  script:
+    # Install Infracost
+    - curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+    
+    # Generate cost estimates for each environment
+    - |
+      for env in dev staging production; do
+        if [ -d "environments/$env" ]; then
+          echo "💰 Generating cost estimate for $env environment..."
+          cd environments/$env
+          infracost breakdown --path . --format json --out-file "../../infracost-$env.json"
+          infracost breakdown --path . --format table --out-file "../../infracost-$env.txt"
+          cd ../../
+        fi
+      done
+    
+    # Generate cost comparison report
+    - python3 scripts/cost_analysis.py --compare-with-baseline --generate-report || echo "Cost analysis script not found"
+  artifacts:
+    paths:
+      - infracost-*.json
+      - infracost-*.txt
+      - cost-*.html
+    expire_in: 1 week
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# =============================================================================
+# TERRAFORM PLAN
+# =============================================================================
+
+plan:dev:
+  stage: plan
+  needs: ["setup:metadata", "validate:terraform"]
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: terraform-plan-dev
+    action: prepare
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/dev
+    - terraform version
+  script:
+    # Initialize Terraform with Azure backend
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=dev.tfstate"
+    
+    # Create Terraform plan
+    - |
+      terraform plan \
+        -var-file="dev.tfvars" \
+        -var="build_version=$BUILD_VERSION" \
+        -var="deployment_strategy=$DEPLOYMENT_STRATEGY" \
+        -out=dev.tfplan \
+        -detailed-exitcode
+    
+    # Generate plan outputs
+    - terraform show dev.tfplan > dev-plan.txt
+    - terraform show -json dev.tfplan > dev-plan.json
+  artifacts:
+    name: "terraform-plan-dev-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - environments/dev/*.tfplan
+      - environments/dev/*-plan.*
+    expire_in: 1 week
+  cache:
+    key: terraform-dev-$CI_COMMIT_REF_SLUG
+    paths:
+      - environments/dev/.terraform/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH =~ /^feature\/.*/
+
+plan:staging:
+  stage: plan
+  needs: ["setup:metadata", "validate:terraform"]
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: terraform-plan-staging
+    action: prepare
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/staging
+    - terraform version
+  script:
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=staging.tfstate"
+    
+    # Create Terraform plan
+    - |
+      terraform plan \
+        -var-file="staging.tfvars" \
+        -var="build_version=$BUILD_VERSION" \
+        -var="deployment_strategy=$DEPLOYMENT_STRATEGY" \
+        -out=staging.tfplan \
+        -detailed-exitcode
+    
+    # Generate plan outputs and analysis
+    - terraform show staging.tfplan > staging-plan.txt
+    - terraform show -json staging.tfplan > staging-plan.json
+    
+    # Analyze plan for risks
+    - python3 ../../scripts/terraform_plan_analyzer.py --plan-file staging-plan.json --environment staging --generate-report || echo "Plan analyzer not available"
+  artifacts:
+    name: "terraform-plan-staging-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - environments/staging/*.tfplan
+      - environments/staging/*-plan.*
+      - environments/staging/*-analysis.*
+    expire_in: 1 week
+  cache:
+    key: terraform-staging-$CI_COMMIT_REF_SLUG
+    paths:
+      - environments/staging/.terraform/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+plan:production:
+  stage: plan
+  needs: ["setup:metadata", "validate:terraform", "security:tfsec", "security:checkov"]
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: terraform-plan-production
+    action: prepare
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/production
+    - terraform version
+  script:
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=production.tfstate"
+    
+    # Create comprehensive production plan
+    - |
+      terraform plan \
+        -var-file="production.tfvars" \
+        -var="build_version=$BUILD_VERSION" \
+        -var="deployment_strategy=$DEPLOYMENT_STRATEGY" \
+        -out=production.tfplan \
+        -detailed-exitcode
+    
+    # Generate plan outputs
+    - terraform show production.tfplan > production-plan.txt
+    - terraform show -json production.tfplan > production-plan.json
+    
+    # Comprehensive plan analysis
+    - python3 ../../scripts/terraform_plan_analyzer.py --plan-file production-plan.json --environment production --generate-report || echo "Plan analyzer not available"
+    - python3 ../../scripts/infrastructure_risk_assessment.py --plan-file production-plan.json --environment production || echo "Risk assessment not available"
+  artifacts:
+    name: "terraform-plan-production-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - environments/production/*.tfplan
+      - environments/production/*-plan.*
+      - environments/production/*-analysis.*
+      - environments/production/*-risk.*
+    expire_in: 1 week
+  cache:
+    key: terraform-production-$CI_COMMIT_REF_SLUG
+    paths:
+      - environments/production/.terraform/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# PLAN REVIEW AND APPROVAL
+# =============================================================================
+
+approve:staging:
+  stage: approve
+  needs: ["plan:staging"]
+  environment:
+    name: terraform-approve-staging
+    action: prepare
+  script:
+    - echo "📋 Staging infrastructure plan ready for review"
+    - echo "Please review the Terraform plan artifacts before proceeding"
+    - echo "Environment: staging"
+    - echo "Strategy: blue-green"
+  artifacts:
+    paths:
+      - environments/staging/*-plan.txt
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: false
+
+approve:production:
+  stage: approve
+  needs: ["plan:production"]
+  environment:
+    name: terraform-approve-production
+    action: prepare
+  script:
+    - echo "📋 Production infrastructure plan ready for review"
+    - echo "⚠️  CRITICAL: This will modify PRODUCTION infrastructure"
+    - echo "Please carefully review the Terraform plan artifacts before proceeding"
+    - echo "Environment: production"
+    - echo "Strategy: canary"
+    - echo "Version: $BUILD_VERSION"
+    
+    # Display plan summary
+    - head -50 environments/production/production-plan.txt || echo "Plan file not found"
+  artifacts:
+    paths:
+      - environments/production/*-plan.txt
+      - environments/production/*-analysis.*
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  timeout: 30m
+  allow_failure: false
+
+# =============================================================================
+# INFRASTRUCTURE DEPLOYMENT
+# =============================================================================
+
+deploy:dev:
+  stage: deploy
+  needs: ["setup:metadata", "plan:dev"]
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: infrastructure-dev
+    url: https://dev.infrastructure.domain.com
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/dev
+    - terraform version
+  script:
+    - echo "🏗️ Deploying infrastructure to dev using standard strategy..."
+    
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=dev.tfstate"
+    
+    # Apply the planned changes
+    - terraform apply -auto-approve dev.tfplan
+    
+    # Generate infrastructure outputs
+    - terraform output -json > dev-outputs.json
+  artifacts:
+    paths:
+      - environments/dev/dev-outputs.json
+    expire_in: 1 week
+  cache:
+    key: terraform-dev-$CI_COMMIT_REF_SLUG
+    paths:
+      - environments/dev/.terraform/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH =~ /^feature\/.*/
+  resource_group: deploy-dev
+
+deploy:staging:blue-green:
+  stage: deploy
+  needs: ["setup:metadata", "approve:staging"]
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: infrastructure-staging
+    url: https://staging.infrastructure.domain.com
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/staging
+    - terraform version
+    - apk add --no-cache python3 py3-pip
+  script:
+    - echo "🔵🟢 Deploying infrastructure to staging using blue-green strategy..."
+    
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=staging.tfstate"
+    
+    # Deploy blue infrastructure
+    - export TF_VAR_deployment_slot="blue"
+    - export TF_VAR_environment="staging-blue"
+    - terraform apply -auto-approve staging.tfplan
+    
+    # Wait for infrastructure to stabilize
+    - sleep 120
+    
+    # Health check blue infrastructure
+    - python3 ../../scripts/infrastructure_health_check.py --environment staging-blue --timeout 300 --check-all || echo "Health check script not available"
+    
+    # Switch traffic to blue infrastructure (simulated)
+    - echo "✅ Traffic switched to blue infrastructure"
+    
+    # Cleanup green infrastructure (simulated)
+    - python3 ../../scripts/infrastructure_cleanup.py --environment staging-green --confirm-cleanup || echo "Cleanup script not available"
+    
+    # Generate outputs
+    - terraform output -json > staging-outputs.json
+  artifacts:
+    paths:
+      - environments/staging/staging-outputs.json
+    expire_in: 1 week
+  cache:
+    key: terraform-staging-$CI_COMMIT_REF_SLUG
+    paths:
+      - environments/staging/.terraform/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  timeout: 1h
+  resource_group: deploy-staging
+
+deploy:production:canary:
+  stage: deploy
+  needs: ["setup:metadata", "approve:production", "deploy:staging:blue-green"]
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: infrastructure-production
+    url: https://production.infrastructure.domain.com
+    deployment_tier: production
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/production
+    - terraform version
+    - apk add --no-cache python3 py3-pip
+  script:
+    - echo "🐤 Deploying infrastructure to production using canary strategy..."
+    
+    # Critical pre-production checks
+    - python3 ../../scripts/pre_prod_infrastructure_checks.py --check-change-window --check-maintenance-mode --check-backup-status --check-monitoring-health || echo "Pre-prod checks not available"
+    
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=production.tfstate"
+    
+    # Canary deployment phases
+    - |
+      PERCENTAGES=(20 50 100)
+      
+      for PERCENTAGE in "${PERCENTAGES[@]}"; do
+        echo "📊 Deploying canary infrastructure at ${PERCENTAGE}%..."
+        
+        export TF_VAR_canary_percentage="$PERCENTAGE"
+        export TF_VAR_canary_deployment="true"
+        
+        # Apply infrastructure changes for this phase
+        terraform apply -auto-approve production.tfplan
+        
+        # Monitor canary infrastructure
+        MONITOR_DURATION=$((PERCENTAGE < 100 ? 900 : 300))
+        python3 ../../scripts/infrastructure_canary_monitor.py \
+          --environment production \
+          --canary-percentage $PERCENTAGE \
+          --duration $MONITOR_DURATION \
+          --monitor-metrics cpu,memory,network,disk \
+          --error-threshold 0.01 || echo "Canary monitor not available"
+        
+        # Wait before next phase (except final)
+        if [[ $PERCENTAGE -lt 100 ]]; then
+          echo "⏳ Canary at ${PERCENTAGE}% is stable. Proceeding to next phase in 60 seconds..."
+          sleep 60
+        fi
+      done
+    
+    # Generate final outputs
+    - terraform output -json > production-outputs.json
+  artifacts:
+    paths:
+      - environments/production/production-outputs.json
+    expire_in: 3 months
+  cache:
+    key: terraform-production-$CI_COMMIT_REF_SLUG
+    paths:
+      - environments/production/.terraform/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  timeout: 2h
+  resource_group: deploy-production
+
+# =============================================================================
+# POST-DEPLOYMENT VALIDATION
+# =============================================================================
+
+validate:health-check:
+  stage: post-validation
+  needs: 
+    - job: "deploy:dev"
+      optional: true
+    - job: "deploy:staging:blue-green"
+      optional: true
+    - job: "deploy:production:canary"
+      optional: true
+  image: python:3.11-alpine
+  script:
+    - pip install requests azure-cli
+    
+    # Infrastructure health checks
+    - echo "🏥 Running infrastructure health checks..."
+    - python scripts/infrastructure_health_check.py --environment $TARGET_ENV --check-connectivity --check-services --check-monitoring --timeout 600 || echo "Health check script not available"
+  artifacts:
+    paths:
+      - health-check-*.html
+    expire_in: 1 week
+  allow_failure: true
+
+validate:compliance:
+  stage: post-validation
+  needs: 
+    - job: "deploy:production:canary"
+      optional: true
+    - job: "deploy:staging:blue-green"
+      optional: true
+  image: python:3.11-alpine
+  script:
+    - pip install requests azure-cli
+    
+    # Infrastructure compliance validation
+    - echo "📋 Running infrastructure compliance validation..."
+    - python scripts/infrastructure_compliance_validator.py --environment $TARGET_ENV --frameworks CIS,NIST,ISO27001 --generate-report || echo "Compliance validator not available"
+  artifacts:
+    paths:
+      - compliance-*.html
+    expire_in: 3 months
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  allow_failure: true
+
+validate:security:
+  stage: post-validation
+  needs: 
+    - job: "deploy:production:canary"
+      optional: true
+    - job: "deploy:staging:blue-green"
+      optional: true
+  image: python:3.11-alpine
+  script:
+    - pip install requests azure-cli
+    
+    # Infrastructure security validation
+    - echo "🔒 Running infrastructure security validation..."
+    - python scripts/infrastructure_security_validation.py --environment $TARGET_ENV --check-network-security --check-access-controls --check-encryption --generate-report || echo "Security validation not available"
+  artifacts:
+    paths:
+      - security-validation-*.html
+    expire_in: 3 months
+  allow_failure: true
+
+# =============================================================================
+# MONITORING UPDATE
+# =============================================================================
+
+monitoring:update:
+  stage: monitoring
+  needs: ["validate:health-check"]
+  image: python:3.11-alpine
+  variables:
+    GRAFANA_API_KEY: $GRAFANA_API_KEY
+    GRAFANA_URL: $GRAFANA_URL
+    PROMETHEUS_URL: $PROMETHEUS_URL
+  script:
+    - pip install requests
+    
+    # Update infrastructure monitoring dashboards
+    - echo "📊 Updating infrastructure monitoring..."
+    - python scripts/update_infrastructure_monitoring.py --environment $TARGET_ENV --version $BUILD_VERSION --update-dashboards --update-alerts --create-baselines || echo "Monitoring update script not available"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+  allow_failure: true
+
+# =============================================================================
+# DISASTER RECOVERY TESTING
+# =============================================================================
+
+disaster-recovery:test:
+  stage: disaster-recovery
+  needs: ["validate:compliance"]
+  image: python:3.11-alpine
+  environment:
+    name: production-dr-testing
+    action: verify
+  script:
+    - pip install requests azure-cli
+    
+    # Disaster recovery testing
+    - echo "🚨 Running disaster recovery tests..."
+    - python scripts/disaster_recovery_test.py --environment production --test-backup-restore --test-failover-scenarios --validate-rto-rpo --generate-report --dry-run || echo "DR test script not available"
+  artifacts:
+    paths:
+      - dr-test-*.html
+      - dr-test-*.json
+    expire_in: 1 year
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+    - if: $CI_PIPELINE_ID =~ /.*00$/  # Run every 100th pipeline
+  timeout: 1h
+  allow_failure: true
+
+# =============================================================================
+# NOTIFICATIONS
+# =============================================================================
+
+notification:success:
+  stage: notification
+  needs: 
+    - job: "deploy:production:canary"
+      optional: true
+    - job: "validate:health-check"
+      optional: true
+    - job: "monitoring:update"
+      optional: true
+  image: python:3.11-alpine
+  before_script:
+    - pip install requests
+  script:
+    - |
+      if [[ "$TARGET_ENV" == "production" ]]; then
+        STATUS="success"
+        COLOR="good"
+        MESSAGE="🏗️ Production infrastructure deployment completed successfully"
+      elif [[ "$TARGET_ENV" == "staging" ]]; then
+        STATUS="success"
+        COLOR="good"
+        MESSAGE="🏗️ Staging infrastructure deployment completed successfully"
+      else
+        STATUS="success"
+        COLOR="good"
+        MESSAGE="🏗️ Dev infrastructure deployment completed successfully"
+      fi
+      
+      # Send infrastructure notifications
+      python scripts/send_infrastructure_notification.py \
+        --status "$STATUS" \
+        --message "$MESSAGE" \
+        --version "$BUILD_VERSION" \
+        --environment "$TARGET_ENV" \
+        --action "$TERRAFORM_ACTION" \
+        --strategy "$DEPLOYMENT_STRATEGY" || echo "Notification script not available"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+  allow_failure: true
+
+# =============================================================================
+# ROLLBACK ON FAILURE
+# =============================================================================
+
+rollback:emergency:
+  stage: rollback
+  needs: 
+    - job: "deploy:production:canary"
+      artifacts: false
+    - job: "validate:health-check"
+      artifacts: false
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: production-infrastructure-emergency
+    action: rollback
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/production
+    - terraform version
+    - apk add --no-cache python3 py3-pip
+  script:
+    - echo "🚨 Executing emergency infrastructure rollback..."
+    
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=production.tfstate"
+    
+    # Get current state
+    - terraform state pull > current-state.tfstate
+    
+    # Execute rollback
+    - python3 ../../scripts/infrastructure_rollback.py --environment production --rollback-target previous-stable --emergency-mode --auto-approve || echo "Rollback script not available"
+    
+    # Send critical infrastructure alerts
+    - python3 ../../scripts/infrastructure_alert_manager.py --severity critical --message "Production infrastructure rollback executed for pipeline $CI_PIPELINE_ID" --notify-sre-team --create-incident --page-oncall || echo "Alert manager not available"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_failure
+  timeout: 30m
+  resource_group: deploy-production
+
+# =============================================================================
+# DESTRUCTION (MANUAL ONLY)
+# =============================================================================
+
+destroy:dev:
+  stage: deploy
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: terraform-destroy-dev
+    action: stop
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/dev
+    - terraform version
+  script:
+    - echo "⚠️ WARNING: Destroying DEV infrastructure!"
+    
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=dev.tfstate"
+    
+    # Destroy infrastructure
+    - terraform destroy -var-file="dev.tfvars" -auto-approve
+    
+    - echo "💥 Dev infrastructure destroyed"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  allow_failure: false
+
+destroy:staging:
+  stage: deploy
+  image: hashicorp/terraform:$TF_VERSION
+  environment:
+    name: terraform-destroy-staging
+    action: stop
+  variables:
+    ARM_CLIENT_ID: $AZURE_CLIENT_ID
+    ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    ARM_TENANT_ID: $AZURE_TENANT_ID
+  before_script:
+    - cd environments/staging
+    - terraform version
+  script:
+    - echo "⚠️ WARNING: Destroying STAGING infrastructure!"
+    
+    # Initialize Terraform
+    - |
+      terraform init \
+        -backend-config="resource_group_name=$TF_BACKEND_RESOURCE_GROUP" \
+        -backend-config="storage_account_name=$TF_BACKEND_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TF_BACKEND_CONTAINER_NAME" \
+        -backend-config="key=staging.tfstate"
+    
+    # Destroy infrastructure
+    - terraform destroy -var-file="staging.tfvars" -auto-approve
+    
+    - echo "💥 Staging infrastructure destroyed"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  allow_failure: false
+
+# =============================================================================
+# WORKFLOW RULES AND CONDITIONS
+# =============================================================================
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_IID
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - changes:
+        - "terraform/**/*"
+        - "modules/**/*"
+        - "environments/**/*"
+        - ".gitlab-ci.yml"

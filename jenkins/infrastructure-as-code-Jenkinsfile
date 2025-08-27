@@ -1,0 +1,854 @@
+#!/usr/bin/env groovy
+
+/*
+ * Jenkins Pipeline for Infrastructure as Code (Terraform)
+ * Advanced Deployment Strategies: Blue-Green Infrastructure, Canary Infrastructure, Multi-Environment
+ * Implements comprehensive Infrastructure CI/CD with zero-downtime infrastructure changes
+ */
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: terraform
+    image: hashicorp/terraform:1.5.7
+    command:
+    - cat
+    tty: true
+    env:
+    - name: TF_IN_AUTOMATION
+      value: "true"
+  - name: azure-cli
+    image: mcr.microsoft.com/azure-cli:latest
+    command:
+    - cat
+    tty: true
+  - name: security-tools
+    image: aquasec/trivy:latest
+    command:
+    - cat
+    tty: true
+  - name: python
+    image: python:3.11-slim
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+    
+    environment {
+        // Terraform Configuration
+        TF_VERSION = '1.5.7'
+        TF_IN_AUTOMATION = 'true'
+        TF_CLI_ARGS = '-no-color'
+        
+        // Azure Configuration
+        AZURE_CLIENT_ID = credentials('azure-client-id')
+        AZURE_CLIENT_SECRET = credentials('azure-client-secret')
+        AZURE_TENANT_ID = credentials('azure-tenant-id')
+        AZURE_SUBSCRIPTION_ID = credentials('azure-subscription-id')
+        
+        // Terraform Backend Configuration
+        TF_BACKEND_RESOURCE_GROUP = 'terraform-state-rg'
+        TF_BACKEND_STORAGE_ACCOUNT = 'terraformstatestorage'
+        TF_BACKEND_CONTAINER_NAME = 'tfstate'
+        
+        // Security and Compliance
+        SNYK_TOKEN = credentials('snyk-token')
+        CHECKOV_API_KEY = credentials('checkov-api-key')
+        
+        // Notification Configuration
+        SLACK_WEBHOOK = credentials('slack-webhook-url')
+        TEAMS_WEBHOOK = credentials('teams-webhook-url')
+    }
+    
+    parameters {
+        choice(
+            choices: ['dev', 'staging', 'production'],
+            description: 'Target environment for infrastructure deployment',
+            name: 'TARGET_ENVIRONMENT'
+        )
+        choice(
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Terraform action to perform',
+            name: 'TERRAFORM_ACTION'
+        )
+        choice(
+            choices: ['standard', 'blue-green', 'canary'],
+            description: 'Infrastructure deployment strategy',
+            name: 'DEPLOYMENT_STRATEGY'
+        )
+        booleanParam(
+            defaultValue: false,
+            description: 'Force infrastructure deployment even with warnings',
+            name: 'FORCE_DEPLOY'
+        )
+        booleanParam(
+            defaultValue: true,
+            description: 'Run infrastructure cost analysis',
+            name: 'RUN_COST_ANALYSIS'
+        )
+        text(
+            defaultValue: '',
+            description: 'Additional Terraform variables (key=value, one per line)',
+            name: 'ADDITIONAL_VARS'
+        )
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '100'))
+        timeout(time: 120, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        skipStagesAfterUnstable()
+    }
+    
+    stages {
+        stage('Checkout & Environment Setup') {
+            steps {
+                script {
+                    // Set dynamic environment variables
+                    env.BUILD_VERSION = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+                    env.WORKSPACE_DIR = env.WORKSPACE
+                    
+                    // Determine target environment based on branch if not specified
+                    if (!params.TARGET_ENVIRONMENT) {
+                        if (env.BRANCH_NAME == 'main') {
+                            env.TARGET_ENV = 'production'
+                        } else if (env.BRANCH_NAME == 'develop') {
+                            env.TARGET_ENV = 'staging'
+                        } else {
+                            env.TARGET_ENV = 'dev'
+                        }
+                    } else {
+                        env.TARGET_ENV = params.TARGET_ENVIRONMENT
+                    }
+                    
+                    echo "Infrastructure deployment version: ${env.BUILD_VERSION}"
+                    echo "Target environment: ${env.TARGET_ENV}"
+                    echo "Terraform action: ${params.TERRAFORM_ACTION}"
+                    echo "Deployment strategy: ${params.DEPLOYMENT_STRATEGY}"
+                }
+                
+                checkout scm
+                
+                // Send build start notification
+                script {
+                    sendInfrastructureNotification('started', 'Infrastructure deployment started', 'info')
+                }
+            }
+        }
+        
+        stage('Infrastructure Validation & Security Scan') {
+            parallel {
+                stage('Terraform Validation') {
+                    steps {
+                        container('terraform') {
+                            sh '''
+                                echo "Validating Terraform configurations..."
+                                
+                                # Format check
+                                terraform fmt -check -recursive .
+                                
+                                # Initialize and validate each environment
+                                for env in dev staging production; do
+                                    if [ -d "environments/$env" ]; then
+                                        echo "Validating $env environment..."
+                                        cd environments/$env
+                                        terraform init -backend=false
+                                        terraform validate
+                                        cd ../../
+                                    fi
+                                done
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Security & Compliance Scanning') {
+                    steps {
+                        container('security-tools') {
+                            sh '''
+                                # Install additional security tools
+                                apk add --no-cache curl python3 py3-pip
+                                pip3 install checkov tfsec-wrapper
+                                
+                                # Download and install tflint
+                                curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+                                
+                                # TFSec security scanning
+                                echo "Running TFSec security analysis..."
+                                curl -Lo tfsec https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64
+                                chmod +x tfsec
+                                ./tfsec . --format json --out tfsec-results.json || true
+                                ./tfsec . --format junit --out tfsec-junit.xml || true
+                                
+                                # Checkov security and compliance scanning
+                                echo "Running Checkov security analysis..."
+                                checkov -d . --framework terraform --output json --output-file checkov-results.json || true
+                                checkov -d . --framework terraform --output junitxml --output-file checkov-junit.xml || true
+                                
+                                # TFLint analysis
+                                echo "Running TFLint analysis..."
+                                tflint --init
+                                find . -name "*.tf" -not -path "./.terraform/*" | xargs dirname | sort -u | while read dir; do
+                                    echo "Running TFLint on $dir"
+                                    tflint "$dir" --format json > "tflint-$(basename $dir).json" || true
+                                done
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true, testResultsPattern: '*-junit.xml'
+                            archiveArtifacts artifacts: '**/*-results.json, **/*-junit.xml, **/tflint-*.json', allowEmptyArchive: true
+                        }
+                    }
+                }
+                
+                stage('Infrastructure Cost Analysis') {
+                    when {
+                        expression { params.RUN_COST_ANALYSIS }
+                    }
+                    steps {
+                        container('python') {
+                            sh '''
+                                # Install Infracost
+                                curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+                                
+                                # Generate cost estimates for each environment
+                                for env in dev staging production; do
+                                    if [ -d "environments/$env" ]; then
+                                        echo "Generating cost estimate for $env environment..."
+                                        cd environments/$env
+                                        infracost breakdown --path . --format json --out-file "../../infracost-$env.json"
+                                        infracost breakdown --path . --format table --out-file "../../infracost-$env.txt"
+                                        cd ../../
+                                    fi
+                                done
+                                
+                                # Generate cost comparison if previous estimates exist
+                                python scripts/cost_analysis.py --compare-with-baseline --generate-report
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'infracost-*.json, infracost-*.txt, cost-analysis-report.html', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            when {
+                expression { params.TERRAFORM_ACTION in ['plan', 'apply'] }
+            }
+            steps {
+                container('terraform') {
+                    script {
+                        // Set up Azure authentication
+                        sh '''
+                            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                        '''
+                        
+                        def environmentDir = "environments/${env.TARGET_ENV}"
+                        
+                        sh """
+                            cd ${environmentDir}
+                            
+                            # Initialize Terraform with Azure backend
+                            terraform init \\
+                                -backend-config="resource_group_name=${TF_BACKEND_RESOURCE_GROUP}" \\
+                                -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \\
+                                -backend-config="container_name=${TF_BACKEND_CONTAINER_NAME}" \\
+                                -backend-config="key=${env.TARGET_ENV}.tfstate"
+                            
+                            # Parse additional variables
+                            EXTRA_VARS=""
+                            if [ ! -z "${params.ADDITIONAL_VARS}" ]; then
+                                echo "${params.ADDITIONAL_VARS}" | while IFS= read -r line; do
+                                    if [ ! -z "\$line" ]; then
+                                        EXTRA_VARS="\$EXTRA_VARS -var='\$line'"
+                                    fi
+                                done
+                            fi
+                            
+                            # Generate Terraform plan
+                            terraform plan \\
+                                -var-file="${env.TARGET_ENV}.tfvars" \\
+                                -var="build_version=${env.BUILD_VERSION}" \\
+                                -var="deployment_strategy=${params.DEPLOYMENT_STRATEGY}" \\
+                                \$EXTRA_VARS \\
+                                -out=${env.TARGET_ENV}.tfplan \\
+                                -detailed-exitcode
+                            
+                            # Generate human-readable plan
+                            terraform show ${env.TARGET_ENV}.tfplan > ${env.TARGET_ENV}-plan.txt
+                            
+                            # Generate JSON plan for analysis
+                            terraform show -json ${env.TARGET_ENV}.tfplan > ${env.TARGET_ENV}-plan.json
+                        """
+                    }
+                }
+                
+                // Analyze the plan for potential issues
+                container('python') {
+                    sh '''
+                        pip3 install jq python-json-logger
+                        
+                        # Analyze Terraform plan
+                        python scripts/terraform_plan_analyzer.py \\
+                            --plan-file environments/${TARGET_ENV}/${TARGET_ENV}-plan.json \\
+                            --environment ${TARGET_ENV} \\
+                            --generate-report
+                        
+                        # Check for high-risk changes
+                        python scripts/infrastructure_risk_assessment.py \\
+                            --plan-file environments/${TARGET_ENV}/${TARGET_ENV}-plan.json \\
+                            --environment ${TARGET_ENV}
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "environments/${env.TARGET_ENV}/*-plan.*, *-analysis-report.*", allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('Plan Review & Approval') {
+            when {
+                allOf {
+                    expression { params.TERRAFORM_ACTION == 'apply' }
+                    expression { env.TARGET_ENV in ['staging', 'production'] }
+                }
+            }
+            steps {
+                script {
+                    // Display plan summary
+                    def planSummary = sh(
+                        script: "cd environments/${env.TARGET_ENV} && terraform show -no-color ${env.TARGET_ENV}.tfplan | head -50",
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Terraform Plan Summary:"
+                    echo planSummary
+                    
+                    // Manual approval for infrastructure changes
+                    try {
+                        def approvalTimeout = env.TARGET_ENV == 'production' ? 30 : 15
+                        timeout(time: approvalTimeout, unit: 'MINUTES') {
+                            def approve = input(
+                                message: "Review the Terraform plan and approve infrastructure changes",
+                                ok: 'Apply Infrastructure Changes',
+                                parameters: [
+                                    booleanParam(
+                                        defaultValue: false,
+                                        description: 'I have reviewed the plan and approve the infrastructure changes',
+                                        name: 'INFRASTRUCTURE_APPROVED'
+                                    ),
+                                    text(
+                                        defaultValue: '',
+                                        description: 'Approval comments (optional)',
+                                        name: 'APPROVAL_COMMENTS'
+                                    )
+                                ]
+                            )
+                            
+                            if (!approve.INFRASTRUCTURE_APPROVED) {
+                                error('Infrastructure changes not approved')
+                            }
+                            
+                            echo "Infrastructure changes approved by: ${env.BUILD_USER}"
+                            if (approve.APPROVAL_COMMENTS) {
+                                echo "Approval comments: ${approve.APPROVAL_COMMENTS}"
+                            }
+                        }
+                    } catch (Exception e) {
+                        currentBuild.result = 'ABORTED'
+                        error('Infrastructure deployment cancelled due to timeout or rejection')
+                    }
+                }
+            }
+        }
+        
+        stage('Infrastructure Deployment') {
+            when {
+                expression { params.TERRAFORM_ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    switch(params.DEPLOYMENT_STRATEGY) {
+                        case 'standard':
+                            deployInfrastructureStandard()
+                            break
+                        case 'blue-green':
+                            deployInfrastructureBlueGreen()
+                            break
+                        case 'canary':
+                            deployInfrastructureCanary()
+                            break
+                        default:
+                            deployInfrastructureStandard()
+                    }
+                }
+            }
+        }
+        
+        stage('Infrastructure Destruction') {
+            when {
+                expression { params.TERRAFORM_ACTION == 'destroy' }
+            }
+            steps {
+                script {
+                    // Extra safety for production destruction
+                    if (env.TARGET_ENV == 'production') {
+                        try {
+                            timeout(time: 10, unit: 'MINUTES') {
+                                def destroy = input(
+                                    message: '⚠️  DANGER: You are about to DESTROY PRODUCTION infrastructure!',
+                                    ok: 'I understand the consequences and want to proceed',
+                                    parameters: [
+                                        string(
+                                            defaultValue: '',
+                                            description: 'Type "DESTROY PRODUCTION INFRASTRUCTURE" to confirm',
+                                            name: 'CONFIRMATION_TEXT'
+                                        ),
+                                        text(
+                                            defaultValue: '',
+                                            description: 'Reason for infrastructure destruction (required)',
+                                            name: 'DESTRUCTION_REASON'
+                                        )
+                                    ]
+                                )
+                                
+                                if (destroy.CONFIRMATION_TEXT != 'DESTROY PRODUCTION INFRASTRUCTURE') {
+                                    error('Confirmation text does not match')
+                                }
+                                
+                                if (!destroy.DESTRUCTION_REASON?.trim()) {
+                                    error('Destruction reason is required')
+                                }
+                                
+                                echo "Production destruction approved by: ${env.BUILD_USER}"
+                                echo "Reason: ${destroy.DESTRUCTION_REASON}"
+                            }
+                        } catch (Exception e) {
+                            currentBuild.result = 'ABORTED'
+                            error('Production destruction cancelled')
+                        }
+                    }
+                }
+                
+                container('terraform') {
+                    sh """
+                        export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                        export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                        export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                        export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                        
+                        cd environments/${env.TARGET_ENV}
+                        
+                        # Initialize Terraform
+                        terraform init \\
+                            -backend-config="resource_group_name=${TF_BACKEND_RESOURCE_GROUP}" \\
+                            -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \\
+                            -backend-config="container_name=${TF_BACKEND_CONTAINER_NAME}" \\
+                            -backend-config="key=${env.TARGET_ENV}.tfstate"
+                        
+                        # Destroy infrastructure
+                        terraform destroy \\
+                            -var-file="${env.TARGET_ENV}.tfvars" \\
+                            -auto-approve
+                    """
+                }
+            }
+        }
+        
+        stage('Post-Deployment Validation') {
+            when {
+                expression { params.TERRAFORM_ACTION == 'apply' }
+            }
+            parallel {
+                stage('Infrastructure Health Check') {
+                    steps {
+                        container('python') {
+                            sh '''
+                                pip3 install azure-cli boto3 requests
+                                
+                                # Run infrastructure health checks
+                                python scripts/infrastructure_health_check.py \\
+                                    --environment ${TARGET_ENV} \\
+                                    --check-connectivity \\
+                                    --check-services \\
+                                    --check-monitoring \\
+                                    --check-security-groups \\
+                                    --timeout 600
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Compliance Validation') {
+                    steps {
+                        container('python') {
+                            sh '''
+                                # Infrastructure compliance validation
+                                python scripts/infrastructure_compliance_validator.py \\
+                                    --environment ${TARGET_ENV} \\
+                                    --frameworks CIS,NIST,ISO27001 \\
+                                    --generate-report
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Performance Baseline') {
+                    steps {
+                        container('python') {
+                            sh '''
+                                # Establish performance baselines for new infrastructure
+                                python scripts/performance_baseline.py \\
+                                    --environment ${TARGET_ENV} \\
+                                    --duration 300 \\
+                                    --create-baseline \\
+                                    --generate-report
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Disaster Recovery Testing') {
+            when {
+                allOf {
+                    expression { params.TERRAFORM_ACTION == 'apply' }
+                    expression { env.TARGET_ENV == 'production' }
+                    expression { env.BUILD_NUMBER.toInteger() % 20 == 0 } // Run every 20th build
+                }
+            }
+            steps {
+                script {
+                    try {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            input message: 'Run Disaster Recovery Tests?', 
+                                  ok: 'Proceed',
+                                  parameters: [
+                                      booleanParam(defaultValue: false, description: 'Execute DR tests', name: 'DR_CONFIRMED')
+                                  ]
+                        }
+                        
+                        container('python') {
+                            sh '''
+                                # Disaster recovery testing
+                                python scripts/disaster_recovery_test.py \\
+                                    --environment ${TARGET_ENV} \\
+                                    --test-backup-restore \\
+                                    --test-failover \\
+                                    --validate-rto-rpo \\
+                                    --generate-report
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "Disaster recovery tests skipped or cancelled"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Archive all artifacts
+            archiveArtifacts artifacts: '**/*.tfplan, **/*-plan.*, **/*-results.json, **/*-report.*', allowEmptyArchive: true
+            
+            // Cleanup sensitive files
+            sh '''
+                find . -name "*.tfplan" -delete
+                find . -name "*-plan.json" -delete
+            '''
+        }
+        
+        success {
+            script {
+                sendInfrastructureNotification(
+                    'success', 
+                    "Infrastructure ${params.TERRAFORM_ACTION} completed successfully", 
+                    'good'
+                )
+                updateInfrastructureMonitoring()
+            }
+        }
+        
+        failure {
+            script {
+                sendInfrastructureNotification(
+                    'failure', 
+                    "Infrastructure ${params.TERRAFORM_ACTION} failed", 
+                    'danger'
+                )
+                if (env.TARGET_ENV == 'production' && params.TERRAFORM_ACTION == 'apply') {
+                    triggerInfrastructureRollback()
+                }
+            }
+        }
+        
+        unstable {
+            script {
+                sendInfrastructureNotification(
+                    'unstable', 
+                    "Infrastructure ${params.TERRAFORM_ACTION} completed with warnings", 
+                    'warning'
+                )
+            }
+        }
+        
+        aborted {
+            script {
+                sendInfrastructureNotification(
+                    'aborted', 
+                    "Infrastructure ${params.TERRAFORM_ACTION} was cancelled", 
+                    'warning'
+                )
+            }
+        }
+    }
+}
+
+// Helper Functions for Infrastructure Deployment Strategies
+
+def deployInfrastructureStandard() {
+    container('terraform') {
+        sh """
+            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+            
+            cd environments/${env.TARGET_ENV}
+            
+            echo "Applying infrastructure changes using standard deployment..."
+            terraform apply -auto-approve ${env.TARGET_ENV}.tfplan
+            
+            # Generate infrastructure outputs
+            terraform output -json > ${env.TARGET_ENV}-outputs.json
+        """
+    }
+}
+
+def deployInfrastructureBlueGreen() {
+    container('terraform') {
+        sh """
+            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+            
+            cd environments/${env.TARGET_ENV}
+            
+            echo "Deploying infrastructure using blue-green strategy..."
+            
+            # Deploy blue infrastructure
+            export TF_VAR_deployment_slot="blue"
+            export TF_VAR_environment="${env.TARGET_ENV}-blue"
+            
+            terraform apply -auto-approve ${env.TARGET_ENV}.tfplan
+            
+            # Wait for infrastructure to stabilize
+            sleep 120
+        """
+    }
+    
+    // Health check blue infrastructure
+    container('python') {
+        sh '''
+            python scripts/infrastructure_health_check.py \\
+                --environment ${TARGET_ENV}-blue \\
+                --timeout 300 \\
+                --check-all
+        '''
+    }
+    
+    // Switch traffic to blue and cleanup green
+    container('azure-cli') {
+        sh """
+            # Authenticate with Azure
+            az login --service-principal -u ${AZURE_CLIENT_ID} -p ${AZURE_CLIENT_SECRET} --tenant ${AZURE_TENANT_ID}
+            az account set --subscription ${AZURE_SUBSCRIPTION_ID}
+            
+            # Switch DNS/Load Balancer to blue
+            python scripts/traffic_switch.py \\
+                --environment ${env.TARGET_ENV} \\
+                --switch-to blue
+            
+            # Cleanup green infrastructure
+            python scripts/infrastructure_cleanup.py \\
+                --environment ${env.TARGET_ENV}-green \\
+                --confirm-cleanup
+        """
+    }
+}
+
+def deployInfrastructureCanary() {
+    def canaryPercentages = ['20', '50', '100']
+    
+    for (int i = 0; i < canaryPercentages.size(); i++) {
+        def percentage = canaryPercentages[i]
+        
+        container('terraform') {
+            sh """
+                export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                
+                cd environments/${env.TARGET_ENV}
+                
+                echo "Deploying canary infrastructure at ${percentage}%..."
+                
+                export TF_VAR_canary_percentage="${percentage}"
+                export TF_VAR_canary_deployment="true"
+                
+                terraform apply -auto-approve ${env.TARGET_ENV}.tfplan
+            """
+        }
+        
+        // Monitor canary infrastructure
+        container('python') {
+            def monitorDuration = percentage.toInteger() < 100 ? 900 : 300 // 15 minutes for partial, 5 for full
+            
+            sh """
+                python scripts/infrastructure_canary_monitor.py \\
+                    --environment ${env.TARGET_ENV} \\
+                    --canary-percentage ${percentage} \\
+                    --duration ${monitorDuration} \\
+                    --monitor-metrics cpu,memory,network,disk \\
+                    --error-threshold 0.01
+            """
+        }
+        
+        // Ask for approval before next phase (except for final deployment)
+        if (i < canaryPercentages.size() - 1) {
+            try {
+                timeout(time: 10, unit: 'MINUTES') {
+                    input message: "Continue to ${canaryPercentages[i+1]}% infrastructure deployment?", 
+                          ok: 'Continue'
+                }
+            } catch (Exception e) {
+                error("Canary infrastructure deployment cancelled")
+            }
+        }
+    }
+}
+
+def sendInfrastructureNotification(String status, String message, String color) {
+    def payload = [
+        channel: '#infrastructure',
+        color: color,
+        message: "${message} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+        teamDomain: 'your-team',
+        token: env.SLACK_TOKEN,
+        baseUrl: 'https://hooks.slack.com/services/',
+        botUser: true
+    ]
+    
+    try {
+        slackSend(payload)
+    } catch (Exception e) {
+        echo "Failed to send Slack notification: ${e.message}"
+    }
+    
+    // Microsoft Teams notification
+    if (env.TEAMS_WEBHOOK) {
+        def teamsPayload = [
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": color == 'good' ? '00FF00' : color == 'danger' ? 'FF0000' : 'FFFF00',
+            "summary": message,
+            "sections": [[
+                "activityTitle": "Infrastructure Deployment Notification",
+                "activitySubtitle": "${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                "markdown": true,
+                "facts": [
+                    ["name": "Status", "value": status],
+                    ["name": "Environment", "value": env.TARGET_ENV],
+                    ["name": "Action", "value": params.TERRAFORM_ACTION],
+                    ["name": "Strategy", "value": params.DEPLOYMENT_STRATEGY],
+                    ["name": "Build URL", "value": env.BUILD_URL]
+                ]
+            ]]
+        ]
+        
+        try {
+            httpRequest(
+                httpMode: 'POST',
+                contentType: 'APPLICATION_JSON',
+                url: env.TEAMS_WEBHOOK,
+                requestBody: groovy.json.JsonOutput.toJson(teamsPayload)
+            )
+        } catch (Exception e) {
+            echo "Failed to send Teams notification: ${e.message}"
+        }
+    }
+}
+
+def updateInfrastructureMonitoring() {
+    container('python') {
+        sh """
+            # Update infrastructure monitoring dashboards
+            python scripts/update_infrastructure_monitoring.py \\
+                --environment ${env.TARGET_ENV} \\
+                --version ${env.BUILD_VERSION} \\
+                --update-dashboards \\
+                --update-alerts \\
+                --create-baselines
+        """
+    }
+}
+
+def triggerInfrastructureRollback() {
+    container('terraform') {
+        sh """
+            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+            
+            cd environments/${env.TARGET_ENV}
+            
+            echo "Triggering emergency infrastructure rollback..."
+            
+            # Get previous stable state
+            terraform state pull > current-state.tfstate
+            
+            # Rollback using previous plan
+            python ../../scripts/infrastructure_rollback.py \\
+                --environment ${env.TARGET_ENV} \\
+                --rollback-target previous-stable \\
+                --emergency-mode
+        """
+    }
+    
+    // Send critical alert
+    container('python') {
+        sh """
+            python scripts/infrastructure_alert_manager.py \\
+                --severity critical \\
+                --message "Production infrastructure rollback executed for build ${BUILD_NUMBER}" \\
+                --notify-sre-team \\
+                --create-incident \\
+                --page-oncall
+        """
+    }
+}

@@ -1,0 +1,535 @@
+# Azure DevOps Pipeline for Naira Remit (Node.js)
+# Advanced Deployment Strategies: Blue-Green, Canary, Rolling Updates, Feature Flags, Multi-Environment
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+  paths:
+    include:
+      - backend/*
+      - frontend/*
+    exclude:
+      - README.md
+      - docs/*
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  - group: naira-remit-prod-secrets
+  - group: naira-remit-staging-secrets
+  - name: nodeVersion
+    value: '18.x'
+  - name: containerRegistry
+    value: 'nairaremitregistry.azurecr.io'
+  - name: backendImageName
+    value: 'naira-remit-backend'
+  - name: frontendImageName
+    value: 'naira-remit-frontend'
+  - name: kubernetesServiceConnection
+    value: 'k8s-connection'
+
+stages:
+  - stage: Build
+    displayName: 'Build and Security Scan'
+    jobs:
+      - job: BuildBackend
+        displayName: 'Build Backend (Node.js)'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(nodeVersion)'
+            displayName: 'Use Node.js $(nodeVersion)'
+
+          - script: |
+              cd backend
+              npm ci --only=production
+              npm install --only=dev
+            displayName: 'Install backend dependencies'
+
+          - script: |
+              cd backend
+              npm run lint
+              npm run format:check
+            displayName: 'Code quality checks'
+
+          - script: |
+              cd backend
+              npm audit --audit-level moderate
+              npx snyk test --severity-threshold=medium
+            displayName: 'Security vulnerability scanning'
+
+          - script: |
+              cd backend
+              npm test -- --coverage --ci --watchAll=false
+            displayName: 'Run backend tests with coverage'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFiles: 'backend/test-results.xml'
+              testRunTitle: 'Backend Tests'
+
+          - task: PublishCodeCoverageResults@1
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: 'backend/coverage/cobertura-coverage.xml'
+
+          - task: Docker@2
+            displayName: 'Build backend Docker image'
+            inputs:
+              containerRegistry: '$(containerRegistry)'
+              repository: '$(backendImageName)'
+              command: 'build'
+              Dockerfile: 'backend/Dockerfile'
+              tags: |
+                $(Build.BuildId)
+                $(Build.SourceBranchName)-$(Build.BuildId)
+                latest
+
+          - task: Docker@2
+            displayName: 'Push backend Docker image'
+            inputs:
+              containerRegistry: '$(containerRegistry)'
+              repository: '$(backendImageName)'
+              command: 'push'
+              tags: |
+                $(Build.BuildId)
+                $(Build.SourceBranchName)-$(Build.BuildId)
+                latest
+
+      - job: BuildFrontend
+        displayName: 'Build Frontend (React/Next.js)'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(nodeVersion)'
+            displayName: 'Use Node.js $(nodeVersion)'
+
+          - script: |
+              cd frontend
+              npm ci
+            displayName: 'Install frontend dependencies'
+
+          - script: |
+              cd frontend
+              npm run lint
+              npm run type-check
+            displayName: 'Frontend code quality checks'
+
+          - script: |
+              cd frontend
+              npm test -- --coverage --watchAll=false
+            displayName: 'Run frontend tests'
+
+          - script: |
+              cd frontend
+              npm run build
+            displayName: 'Build frontend for production'
+
+          - task: Docker@2
+            displayName: 'Build frontend Docker image'
+            inputs:
+              containerRegistry: '$(containerRegistry)'
+              repository: '$(frontendImageName)'
+              command: 'build'
+              Dockerfile: 'frontend/Dockerfile'
+              tags: |
+                $(Build.BuildId)
+                $(Build.SourceBranchName)-$(Build.BuildId)
+                latest
+
+          - task: Docker@2
+            displayName: 'Push frontend Docker image'
+            inputs:
+              containerRegistry: '$(containerRegistry)'
+              repository: '$(frontendImageName)'
+              command: 'push'
+              tags: |
+                $(Build.BuildId)
+                $(Build.SourceBranchName)-$(Build.BuildId)
+                latest
+
+  - stage: DeployDev
+    displayName: 'Deploy to Development'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployToDev
+        displayName: 'Rolling Update Deployment to Dev'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'naira-remit-dev'
+        strategy:
+          rolling:
+            maxParallel: 1
+            preDeploy:
+              steps:
+                - script: |
+                    echo "Running pre-deployment checks for dev environment"
+                    node scripts/pre-deployment-checks.js --env dev
+                  displayName: 'Pre-deployment validation'
+            deploy:
+              steps:
+                - task: KubernetesManifest@0
+                  displayName: 'Deploy backend to dev'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-dev'
+                    manifests: |
+                      k8s/dev/backend-deployment.yaml
+                      k8s/dev/backend-service.yaml
+                    containers: '$(containerRegistry)/$(backendImageName):$(Build.BuildId)'
+
+                - task: KubernetesManifest@0
+                  displayName: 'Deploy frontend to dev'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-dev'
+                    manifests: |
+                      k8s/dev/frontend-deployment.yaml
+                      k8s/dev/frontend-service.yaml
+                      k8s/dev/ingress.yaml
+                    containers: '$(containerRegistry)/$(frontendImageName):$(Build.BuildId)'
+
+            postRouteTraffic:
+              steps:
+                - script: |
+                    node scripts/smoke-tests.js --endpoint https://naira-remit-dev.internal
+                  displayName: 'Post-deployment smoke tests'
+
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: BlueGreenStaging
+        displayName: 'Blue-Green Deployment to Staging'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'naira-remit-staging'
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - script: |
+                    node scripts/feature-flag-manager.js --env staging --action prepare
+                  displayName: 'Prepare staging feature flags'
+                  
+            deploy:
+              steps:
+                # Deploy backend to Blue environment
+                - task: KubernetesManifest@0
+                  displayName: 'Deploy backend to Blue environment'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-staging'
+                    manifests: |
+                      k8s/staging/backend-deployment-blue.yaml
+                      k8s/staging/backend-service-blue.yaml
+                    containers: '$(containerRegistry)/$(backendImageName):$(Build.BuildId)'
+
+                # Deploy frontend to Blue environment
+                - task: KubernetesManifest@0
+                  displayName: 'Deploy frontend to Blue environment'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-staging'
+                    manifests: |
+                      k8s/staging/frontend-deployment-blue.yaml
+                      k8s/staging/frontend-service-blue.yaml
+                    containers: '$(containerRegistry)/$(frontendImageName):$(Build.BuildId)'
+
+                # Health check on Blue environment
+                - script: |
+                    echo "Performing health checks on Blue environment..."
+                    node scripts/health-checker.js \
+                      --backend-url http://naira-remit-backend-blue-staging.internal \
+                      --frontend-url http://naira-remit-frontend-blue-staging.internal \
+                      --timeout 300 \
+                      --retry-count 5
+                  displayName: 'Blue environment health check'
+
+                # Switch traffic to Blue (Blue-Green switch)
+                - task: KubernetesManifest@0
+                  displayName: 'Switch traffic to Blue'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-staging'
+                    manifests: |
+                      k8s/staging/ingress-blue.yaml
+                      k8s/staging/service-main.yaml
+
+                # Integration tests on staging
+                - script: |
+                    node scripts/integration-tests.js --env staging --timeout 600
+                  displayName: 'Run integration tests'
+
+            postRouteTraffic:
+              steps:
+                # Enable staging feature flags
+                - script: |
+                    node scripts/feature-flag-manager.js \
+                      --env staging \
+                      --action enable \
+                      --flags enhanced-security,new-payment-methods
+                  displayName: 'Enable staging feature flags'
+
+                # Cleanup Green environment
+                - task: Kubernetes@1
+                  displayName: 'Cleanup Green environment'
+                  inputs:
+                    connectionType: 'kubernetesServiceConnection'
+                    kubernetesServiceEndpoint: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-staging'
+                    command: 'delete'
+                    arguments: 'deployment naira-remit-backend-green naira-remit-frontend-green --ignore-not-found=true'
+
+  - stage: DeployProduction
+    displayName: 'Deploy to Production'
+    dependsOn: DeployStaging
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: CanaryProduction
+        displayName: 'Canary Deployment to Production'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'naira-remit-production'
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - script: |
+                    # Pre-production checks including compliance
+                    node scripts/pre-prod-compliance-checks.js \
+                      --check-regulatory-compliance \
+                      --check-fraud-detection \
+                      --check-system-capacity
+                  displayName: 'Pre-production compliance validation'
+
+            deploy:
+              steps:
+                # Deploy Canary backend with 10% traffic
+                - task: KubernetesManifest@0
+                  displayName: 'Deploy Canary backend (10% traffic)'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-prod'
+                    manifests: |
+                      k8s/prod/backend-deployment-canary.yaml
+                      k8s/prod/backend-service-canary.yaml
+                      k8s/prod/istio-virtual-service-backend-10.yaml
+                    containers: '$(containerRegistry)/$(backendImageName):$(Build.BuildId)'
+
+                # Deploy Canary frontend with 10% traffic
+                - task: KubernetesManifest@0
+                  displayName: 'Deploy Canary frontend (10% traffic)'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-prod'
+                    manifests: |
+                      k8s/prod/frontend-deployment-canary.yaml
+                      k8s/prod/frontend-service-canary.yaml
+                      k8s/prod/istio-virtual-service-frontend-10.yaml
+                    containers: '$(containerRegistry)/$(frontendImageName):$(Build.BuildId)'
+
+                # Monitor Canary at 10% for 15 minutes
+                - script: |
+                    node scripts/canary-monitor.js \
+                      --traffic-percentage 10 \
+                      --duration 900 \
+                      --error-threshold 0.005 \
+                      --transaction-success-threshold 99.5 \
+                      --fraud-detection-check \
+                      --rollback-on-failure
+                  displayName: 'Monitor Canary at 10% (15 minutes)'
+
+                # Increase to 30% traffic
+                - task: KubernetesManifest@0
+                  displayName: 'Increase Canary to 30% traffic'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-prod'
+                    manifests: |
+                      k8s/prod/istio-virtual-service-backend-30.yaml
+                      k8s/prod/istio-virtual-service-frontend-30.yaml
+
+                # Monitor at 30% for 15 minutes
+                - script: |
+                    node scripts/canary-monitor.js \
+                      --traffic-percentage 30 \
+                      --duration 900 \
+                      --error-threshold 0.003 \
+                      --transaction-success-threshold 99.7 \
+                      --business-metrics-check \
+                      --rollback-on-failure
+                  displayName: 'Monitor Canary at 30% (15 minutes)'
+
+                # Increase to 60% traffic
+                - task: KubernetesManifest@0
+                  displayName: 'Increase Canary to 60% traffic'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-prod'
+                    manifests: |
+                      k8s/prod/istio-virtual-service-backend-60.yaml
+                      k8s/prod/istio-virtual-service-frontend-60.yaml
+
+                # Monitor at 60% for 20 minutes
+                - script: |
+                    node scripts/canary-monitor.js \
+                      --traffic-percentage 60 \
+                      --duration 1200 \
+                      --error-threshold 0.002 \
+                      --transaction-success-threshold 99.8 \
+                      --compliance-metrics-check \
+                      --rollback-on-failure
+                  displayName: 'Monitor Canary at 60% (20 minutes)'
+
+                # Full deployment if successful
+                - task: KubernetesManifest@0
+                  displayName: 'Complete Canary deployment (100%)'
+                  inputs:
+                    action: 'deploy'
+                    kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+                    namespace: 'naira-remit-prod'
+                    manifests: |
+                      k8s/prod/backend-deployment-main.yaml
+                      k8s/prod/frontend-deployment-main.yaml
+                      k8s/prod/istio-virtual-service-100.yaml
+
+            postRouteTraffic:
+              steps:
+                # Gradual Feature Flag Rollout for Financial Features
+                - script: |
+                    node scripts/feature-flag-manager.js \
+                      --env production \
+                      --action gradual-enable \
+                      --flags new-currency-pairs \
+                      --rollout-percentage 15 \
+                      --monitor-duration 600
+                  displayName: 'Gradual feature rollout (15%)'
+
+                - script: |
+                    node scripts/feature-flag-manager.js \
+                      --env production \
+                      --action increase-rollout \
+                      --flags new-currency-pairs \
+                      --rollout-percentage 50 \
+                      --monitor-duration 900
+                  displayName: 'Increase feature rollout (50%)'
+
+                - script: |
+                    node scripts/feature-flag-manager.js \
+                      --env production \
+                      --action complete-rollout \
+                      --flags new-currency-pairs
+                  displayName: 'Complete feature rollout (100%)'
+
+      - job: AutomatedRollback
+        displayName: 'Automated Rollback on Failure'
+        dependsOn: CanaryProduction
+        condition: failed()
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: KubernetesManifest@0
+            displayName: 'Emergency rollback to stable version'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: '$(kubernetesServiceConnection)'
+              namespace: 'naira-remit-prod'
+              manifests: |
+                k8s/prod/istio-virtual-service-rollback.yaml
+                k8s/prod/deployment-rollback.yaml
+
+          - script: |
+              # Emergency procedures for financial system
+              node scripts/feature-flag-manager.js \
+                --env production \
+                --action emergency-disable \
+                --flags new-currency-pairs,enhanced-security
+                
+              # Critical alert for financial compliance
+              node scripts/alert-manager.js \
+                --severity critical \
+                --message "Production rollback executed - Financial services impacted" \
+                --notify-compliance-team \
+                --create-incident \
+                --regulatory-notification
+            displayName: 'Emergency rollback and compliance notifications'
+
+  - stage: PostDeploymentValidation
+    displayName: 'Post-Deployment Validation & Compliance'
+    dependsOn: DeployProduction
+    condition: succeeded()
+    jobs:
+      - job: ValidationAndCompliance
+        displayName: 'Comprehensive validation and compliance checks'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              # End-to-end financial transaction tests
+              node scripts/e2e-financial-tests.js \
+                --test-suite payment-processing \
+                --test-suite compliance-checks \
+                --test-suite fraud-detection \
+                --env production \
+                --timeout 2400
+            displayName: 'End-to-end financial system tests'
+
+          - script: |
+              # Regulatory compliance validation
+              node scripts/compliance-validator.js \
+                --check-aml-compliance \
+                --check-kyc-processes \
+                --check-transaction-reporting \
+                --generate-compliance-report
+            displayName: 'Regulatory compliance validation'
+
+          - script: |
+              # Performance benchmarking for financial transactions
+              node scripts/performance-benchmark.js \
+                --env production \
+                --test-transaction-throughput \
+                --test-payment-latency \
+                --duration 600 \
+                --generate-financial-metrics-report
+            displayName: 'Financial performance benchmarking'
+
+          - script: |
+              # Success notifications to stakeholders
+              node scripts/notification-manager.js \
+                --event deployment-success \
+                --version $(Build.BuildId) \
+                --env production \
+                --notify-channels slack,email,sms \
+                --include-business-metrics \
+                --notify-compliance-team
+            displayName: 'Success notifications and business metrics'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'compliance-reports/'
+              artifactName: 'compliance-reports-$(Build.BuildId)'

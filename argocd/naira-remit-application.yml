@@ -1,0 +1,711 @@
+# ArgoCD Application Configuration for Naira Remit Node.js App
+# Advanced Deployment Strategies: Blue-Green, Canary, Rolling Updates with Argo Rollouts
+# Implements GitOps with progressive delivery and automated rollbacks
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: naira-remit-app
+  namespace: argocd
+  labels:
+    app: naira-remit-app
+    env: production
+    tier: remittance
+    component: backend
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: remittance-deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: remittance-deployments
+    notifications.argoproj.io/subscribe.on-health-degraded.pagerduty: fintech-team
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: naira-remit
+  
+  # Source Configuration
+  source:
+    repoURL: https://github.com/olaitanojo/Naira-remit-node.js-app.git
+    targetRevision: HEAD
+    path: k8s/overlays/production
+    
+    # Kustomize Configuration
+    kustomize:
+      namePrefix: naira-remit-
+      nameSuffix: -prod
+      commonLabels:
+        app: naira-remit-app
+        env: production
+        managed-by: argocd
+      commonAnnotations:
+        deployment.kubernetes.io/revision: "1"
+        argocd.argoproj.io/tracking-id: naira-remit-app:argoproj.io/Application:argocd/naira-remit-app
+      
+      # Image tag substitution from CI/CD
+      images:
+        - name: nairaremitregistry.azurecr.io/naira-remit-app
+          newTag: latest
+      
+      # Patches for environment-specific configurations
+      patches:
+        - target:
+            group: apps
+            version: v1
+            kind: Deployment
+            name: naira-remit-app
+          patch: |-
+            - op: replace
+              path: /spec/replicas
+              value: 4
+            - op: replace
+              path: /spec/template/spec/containers/0/resources/limits/memory
+              value: "1Gi"
+            - op: replace
+              path: /spec/template/spec/containers/0/resources/limits/cpu
+              value: "800m"
+        
+        - target:
+            group: argoproj.io
+            version: v1alpha1
+            kind: Rollout
+            name: naira-remit-app
+          patch: |-
+            - op: replace
+              path: /spec/strategy/blueGreen/activeService
+              value: naira-remit-app
+            - op: replace
+              path: /spec/strategy/blueGreen/previewService
+              value: naira-remit-app-preview
+            - op: replace
+              path: /spec/strategy/blueGreen/autoPromotionEnabled
+              value: false
+      
+      # Replica overrides for production
+      replicas:
+        - name: naira-remit-app
+          count: 4
+        - name: naira-remit-worker
+          count: 2
+        - name: naira-remit-scheduler
+          count: 1
+
+  # Destination Configuration
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: naira-remit-prod
+    
+  # Sync Policy Configuration
+  syncPolicy:
+    # Automated sync with self-healing
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    
+    # Sync options
+    syncOptions:
+      - Validate=false
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+      - RespectIgnoreDifferences=true
+    
+    # Retry configuration
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Revision History
+  revisionHistoryLimit: 10
+  
+  # Ignore differences for dynamic fields
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+      name: naira-remit-app
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/clusterIP
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /status
+
+---
+# ArgoCD AppProject for Naira Remit
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: naira-remit
+  namespace: argocd
+  labels:
+    project: naira-remit
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  description: "Naira Remit Node.js Application with Advanced Deployment Strategies"
+  
+  # Source repositories allowed for this project
+  sourceRepos:
+    - 'https://github.com/olaitanojo/Naira-remit-node.js-app.git'
+    - 'https://github.com/olaitanojo/Payment-gateway-api.git'
+    - 'https://charts.bitnami.com/bitnami'
+    - 'https://prometheus-community.github.io/helm-charts'
+    - 'https://argoproj.github.io/argo-helm'
+  
+  # Destination clusters and namespaces
+  destinations:
+    - namespace: 'naira-remit-*'
+      server: https://kubernetes.default.svc
+    - namespace: 'remittance-*'
+      server: https://kubernetes.default.svc
+    - namespace: 'monitoring'
+      server: https://kubernetes.default.svc
+  
+  # Cluster resource whitelist
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+  
+  # Namespace resource whitelist
+  namespaceResourceWhitelist:
+    - group: ''
+      kind: ConfigMap
+    - group: ''
+      kind: Secret
+    - group: ''
+      kind: Service
+    - group: ''
+      kind: ServiceAccount
+    - group: ''
+      kind: PersistentVolumeClaim
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: apps
+      kind: DaemonSet
+    - group: apps
+      kind: ReplicaSet
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: argoproj.io
+      kind: Rollout
+    - group: argoproj.io
+      kind: AnalysisTemplate
+    - group: argoproj.io
+      kind: AnalysisRun
+    - group: networking.istio.io
+      kind: VirtualService
+    - group: networking.istio.io
+      kind: DestinationRule
+    - group: security.istio.io
+      kind: PeerAuthentication
+    - group: monitoring.coreos.com
+      kind: ServiceMonitor
+    - group: monitoring.coreos.com
+      kind: PrometheusRule
+
+  # RBAC roles for this project
+  roles:
+    - name: admin
+      description: "Admin access to Naira Remit applications"
+      policies:
+        - p, proj:naira-remit:admin, applications, *, naira-remit/*, allow
+        - p, proj:naira-remit:admin, repositories, *, *, allow
+        - p, proj:naira-remit:admin, certificates, *, *, allow
+        - p, proj:naira-remit:admin, clusters, *, *, allow
+      groups:
+        - naira-remit-admins
+        - fintech-team
+    
+    - name: developer
+      description: "Developer access to Naira Remit applications"
+      policies:
+        - p, proj:naira-remit:developer, applications, get, naira-remit/*, allow
+        - p, proj:naira-remit:developer, applications, sync, naira-remit/*, allow
+        - p, proj:naira-remit:developer, repositories, get, *, allow
+        - p, proj:naira-remit:developer, logs, get, naira-remit/*, allow
+      groups:
+        - naira-remit-developers
+    
+    - name: readonly
+      description: "Read-only access to Naira Remit applications"
+      policies:
+        - p, proj:naira-remit:readonly, applications, get, naira-remit/*, allow
+        - p, proj:naira-remit:readonly, repositories, get, *, allow
+        - p, proj:naira-remit:readonly, logs, get, naira-remit/*, allow
+      groups:
+        - naira-remit-viewers
+
+  # Sync windows (maintenance windows)
+  syncWindows:
+    - kind: allow
+      schedule: '0 9-17 * * 1-5'  # Business hours Mon-Fri
+      duration: 8h
+      applications:
+        - '*'
+      manualSync: true
+    - kind: deny
+      schedule: '0 20-23 * * 1-5'  # Evening hours
+      duration: 3h
+      applications:
+        - '*'
+      manualSync: false
+
+---
+# Argo Rollout Configuration for Blue-Green Deployments
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: naira-remit-app
+  namespace: naira-remit-prod
+  labels:
+    app: naira-remit-app
+    env: production
+    tier: remittance
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    rollout.argoproj.io/revision: "1"
+spec:
+  replicas: 4
+  
+  # Rollout strategy with blue-green deployment
+  strategy:
+    blueGreen:
+      # Services for active and preview environments
+      activeService: naira-remit-app
+      previewService: naira-remit-app-preview
+      
+      # Auto promotion disabled for manual control
+      autoPromotionEnabled: false
+      
+      # Scale down old replicaSet delay after promotion
+      scaleDownDelaySeconds: 30
+      prePromotionAnalysis:
+        templates:
+          - templateName: preview-success-rate
+          - templateName: preview-latency-check
+        args:
+          - name: service-name
+            value: naira-remit-app-preview
+          - name: namespace
+            value: naira-remit-prod
+      
+      postPromotionAnalysis:
+        templates:
+          - templateName: post-promotion-analysis
+        args:
+          - name: service-name
+            value: naira-remit-app
+          - name: namespace
+            value: naira-remit-prod
+      
+      # Preview replica count
+      previewReplicaCount: 2
+      
+      # Anti-affinity to ensure blue-green pods are distributed
+      antiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution: {}
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["naira-remit-app"]
+            topologyKey: kubernetes.io/hostname
+  
+  # Rollout selector
+  selector:
+    matchLabels:
+      app: naira-remit-app
+      tier: remittance
+  
+  # Pod template
+  template:
+    metadata:
+      labels:
+        app: naira-remit-app
+        tier: remittance
+        env: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        
+      # Service account
+      serviceAccountName: naira-remit-app
+      
+      # Node selection and affinity
+      nodeSelector:
+        workload: remittance
+        
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["naira-remit-app"]
+                topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: workload
+                    operator: In
+                    values: ["remittance", "general"]
+      
+      # Tolerations for dedicated nodes
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "remittance"
+          effect: "NoSchedule"
+      
+      # Init containers
+      initContainers:
+        - name: wait-for-dependencies
+          image: busybox:1.35
+          command: ['sh', '-c']
+          args:
+            - |
+              echo "Waiting for dependencies..."
+              until nc -z mongodb-service 27017; do
+                echo "Waiting for MongoDB..."
+                sleep 5
+              done
+              until nc -z redis-service 6379; do
+                echo "Waiting for Redis..."
+                sleep 5
+              done
+              echo "Dependencies are ready!"
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      
+      # Main containers
+      containers:
+        - name: naira-remit-app
+          image: nairaremitregistry.azurecr.io/naira-remit-app:latest
+          
+          # Container ports
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          
+          # Environment variables
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: PORT
+              value: "3000"
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: naira-remit-secrets
+                  key: mongodb-uri
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: naira-remit-secrets
+                  key: redis-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: naira-remit-secrets
+                  key: jwt-secret
+            - name: PAYMENT_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: naira-remit-secrets
+                  key: payment-api-key
+          
+          # Resource limits and requests
+          resources:
+            limits:
+              cpu: 800m
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+            requests:
+              cpu: 400m
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+            successThreshold: 1
+          
+          # Volume mounts
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: temp
+              mountPath: /tmp
+            - name: logs
+              mountPath: /app/logs
+          
+          # Security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            runAsUser: 1001
+      
+      # Volumes
+      volumes:
+        - name: config
+          configMap:
+            name: naira-remit-config
+            defaultMode: 0644
+        - name: temp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: logs
+          emptyDir:
+            sizeLimit: 5Gi
+      
+      # DNS configuration
+      dnsPolicy: ClusterFirst
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: edns0
+      
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+      
+      # Restart policy
+      restartPolicy: Always
+
+---
+# Analysis Templates for Blue-Green Validation
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: preview-success-rate
+  namespace: naira-remit-prod
+  labels:
+    app: naira-remit-app
+spec:
+  metrics:
+    - name: preview-success-rate
+      initialDelay: 30s
+      interval: 30s
+      count: 10
+      successCondition: result[0] >= 0.98
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}", status!~"5.."}[1m])) / 
+            sum(rate(http_requests_total{service="{{args.service-name}}"}[1m]))
+  args:
+    - name: service-name
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: preview-latency-check
+  namespace: naira-remit-prod
+  labels:
+    app: naira-remit-app
+spec:
+  metrics:
+    - name: preview-latency-p95
+      initialDelay: 30s
+      interval: 30s
+      count: 10
+      successCondition: result[0] <= 300
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.95, 
+              sum(rate(http_request_duration_seconds_bucket{service="{{args.service-name}}"}[1m])) by (le)
+            ) * 1000
+  args:
+    - name: service-name
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: post-promotion-analysis
+  namespace: naira-remit-prod
+  labels:
+    app: naira-remit-app
+spec:
+  metrics:
+    - name: post-promotion-success-rate
+      initialDelay: 60s
+      interval: 60s
+      count: 5
+      successCondition: result[0] >= 0.98
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}", status!~"5.."}[2m])) / 
+            sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+    
+    - name: post-promotion-transaction-rate
+      initialDelay: 120s
+      interval: 120s
+      count: 3
+      successCondition: result[0] >= 50
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            rate(remittance_transactions_total{service="{{args.service-name}}", status="success"}[2m]) * 60
+    
+    - name: post-promotion-error-rate
+      initialDelay: 60s
+      interval: 60s
+      count: 5
+      successCondition: result[0] <= 0.02
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}", status=~"5.."}[2m])) / 
+            sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+  args:
+    - name: service-name
+    - name: namespace
+
+---
+# Istio Virtual Service for Traffic Management
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: naira-remit-app-vs
+  namespace: naira-remit-prod
+  labels:
+    app: naira-remit-app
+spec:
+  hosts:
+    - naira-remit-app
+    - naira-remit.example.com
+  http:
+    - match:
+        - headers:
+            canary:
+              exact: "true"
+      route:
+        - destination:
+            host: naira-remit-app-preview
+            port:
+              number: 80
+    - route:
+        - destination:
+            host: naira-remit-app
+            port:
+              number: 80
+
+---
+# Istio Destination Rule
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: naira-remit-app-dr
+  namespace: naira-remit-prod
+  labels:
+    app: naira-remit-app
+spec:
+  host: naira-remit-app
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        maxRequestsPerConnection: 10
+    loadBalancer:
+      simple: LEAST_CONN
+    outlierDetection:
+      consecutiveErrors: 3
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50

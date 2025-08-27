@@ -1,0 +1,906 @@
+# GitHub Actions Workflow for Infrastructure as Code (Terraform)
+# Advanced Deployment Strategies: Blue-Green Infrastructure, Canary Infrastructure, Multi-Environment
+# Complete Infrastructure CI/CD pipeline with zero-downtime infrastructure changes
+
+name: 'Infrastructure as Code - Advanced CI/CD'
+
+on:
+  push:
+    branches: [main, develop, feature/*]
+    paths:
+      - 'terraform/**'
+      - 'modules/**' 
+      - 'environments/**'
+      - '.github/workflows/infrastructure-*.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'terraform/**'
+      - 'modules/**'
+      - 'environments/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment for infrastructure deployment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - dev
+          - staging  
+          - production
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      deployment_strategy:
+        description: 'Infrastructure deployment strategy'
+        required: true
+        default: 'standard'
+        type: choice
+        options:
+          - standard
+          - blue-green
+          - canary
+      force_deploy:
+        description: 'Force deployment even with warnings'
+        required: false
+        default: false
+        type: boolean
+      run_cost_analysis:
+        description: 'Run infrastructure cost analysis'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  TF_VERSION: '1.5.7'
+  TF_IN_AUTOMATION: true
+  TF_CLI_ARGS: '-no-color'
+  ARM_USE_OIDC: true
+  
+  # Terraform Backend Configuration
+  TF_BACKEND_RESOURCE_GROUP: terraform-state-rg
+  TF_BACKEND_STORAGE_ACCOUNT: terraformstatestorage
+  TF_BACKEND_CONTAINER_NAME: tfstate
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  # ============================================================================
+  # SETUP AND METADATA
+  # ============================================================================
+  setup:
+    name: 'Setup Infrastructure Metadata'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      target-env: ${{ steps.metadata.outputs.target-env }}
+      terraform-action: ${{ steps.metadata.outputs.terraform-action }}
+      deployment-strategy: ${{ steps.metadata.outputs.deployment-strategy }}
+      should-deploy: ${{ steps.metadata.outputs.should-deploy }}
+      changed-environments: ${{ steps.changes.outputs.environments }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        
+      - name: Generate build metadata
+        id: metadata
+        run: |
+          # Generate version
+          VERSION="${{ github.run_number }}-${GITHUB_SHA::7}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          
+          # Determine target environment and action
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TARGET_ENV="${{ github.event.inputs.environment }}"
+            TERRAFORM_ACTION="${{ github.event.inputs.action }}"
+            DEPLOYMENT_STRATEGY="${{ github.event.inputs.deployment_strategy }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TARGET_ENV="production"
+            TERRAFORM_ACTION="apply"
+            DEPLOYMENT_STRATEGY="canary"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            TARGET_ENV="staging"
+            TERRAFORM_ACTION="apply"
+            DEPLOYMENT_STRATEGY="blue-green"
+          else
+            TARGET_ENV="dev"
+            TERRAFORM_ACTION="plan"
+            DEPLOYMENT_STRATEGY="standard"
+          fi
+          
+          echo "target-env=${TARGET_ENV}" >> $GITHUB_OUTPUT
+          echo "terraform-action=${TERRAFORM_ACTION}" >> $GITHUB_OUTPUT
+          echo "deployment-strategy=${DEPLOYMENT_STRATEGY}" >> $GITHUB_OUTPUT
+          
+          # Determine if should deploy
+          SHOULD_DEPLOY="false"
+          if [[ "${{ github.event_name }}" == "push" && ("${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/develop") ]]; then
+            SHOULD_DEPLOY="true"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.action }}" == "apply" ]]; then
+            SHOULD_DEPLOY="true"
+          fi
+          echo "should-deploy=${SHOULD_DEPLOY}" >> $GITHUB_OUTPUT
+          
+          echo "🏗️ Infrastructure Version: ${VERSION}"
+          echo "🎯 Target Environment: ${TARGET_ENV}"
+          echo "⚡ Terraform Action: ${TERRAFORM_ACTION}"
+          echo "📦 Deployment Strategy: ${DEPLOYMENT_STRATEGY}"
+          echo "🔄 Should Deploy: ${SHOULD_DEPLOY}"
+
+      - name: Detect changed environments
+        id: changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            dev:
+              - 'environments/dev/**'
+              - 'modules/**'
+            staging:
+              - 'environments/staging/**'
+              - 'modules/**'
+            production:
+              - 'environments/production/**'
+              - 'modules/**'
+
+  # ============================================================================
+  # INFRASTRUCTURE VALIDATION AND SECURITY SCAN
+  # ============================================================================
+  validate:
+    name: 'Infrastructure Validation'
+    runs-on: ubuntu-latest
+    needs: setup
+    strategy:
+      matrix:
+        validation: [terraform, security, cost]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Terraform Format and Validation
+        if: matrix.validation == 'terraform'
+        run: |
+          echo "🔍 Validating Terraform configurations..."
+          
+          # Format check
+          terraform fmt -check -recursive .
+          
+          # Initialize and validate each environment
+          for env in dev staging production; do
+            if [ -d "environments/$env" ]; then
+              echo "Validating $env environment..."
+              cd environments/$env
+              terraform init -backend=false
+              terraform validate
+              cd ../../
+            fi
+          done
+          
+      - name: Security and Compliance Scanning
+        if: matrix.validation == 'security'
+        run: |
+          # Install security tools
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+          curl -Lo tfsec https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64
+          chmod +x tfsec && sudo mv tfsec /usr/local/bin/
+          pip3 install checkov
+          
+          # TFSec security scanning
+          echo "🔒 Running TFSec security analysis..."
+          tfsec . --format json --out tfsec-results.json || true
+          tfsec . --format sarif --out tfsec-results.sarif || true
+          
+          # Checkov security and compliance scanning
+          echo "🔒 Running Checkov security analysis..."
+          checkov -d . --framework terraform --output json --output-file checkov-results.json || true
+          checkov -d . --framework terraform --output sarif --output-file checkov-results.sarif || true
+          
+          # TFLint analysis
+          echo "🔍 Running TFLint analysis..."
+          tflint --init
+          find . -name "*.tf" -not -path "./.terraform/*" | xargs dirname | sort -u | while read dir; do
+            echo "Running TFLint on $dir"
+            tflint "$dir" --format json > "tflint-$(basename $dir).json" || true
+          done
+          
+      - name: Upload security scan results
+        if: matrix.validation == 'security'
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: tfsec-results.sarif
+          category: tfsec
+          
+      - name: Infrastructure Cost Analysis
+        if: matrix.validation == 'cost' && github.event.inputs.run_cost_analysis != 'false'
+        run: |
+          # Install Infracost
+          curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+          
+          # Generate cost estimates for each environment
+          for env in dev staging production; do
+            if [ -d "environments/$env" ]; then
+              echo "💰 Generating cost estimate for $env environment..."
+              cd environments/$env
+              infracost breakdown --path . --format json --out-file "../../infracost-$env.json"
+              infracost breakdown --path . --format table --out-file "../../infracost-$env.txt"
+              cd ../../
+            fi
+          done
+          
+          # Generate cost comparison report
+          python scripts/cost_analysis.py --compare-with-baseline --generate-report
+          
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: validation-${{ matrix.validation }}-reports
+          path: |
+            *-results.json
+            *-results.sarif
+            tflint-*.json
+            infracost-*.json
+            infracost-*.txt
+            cost-*.html
+          retention-days: 30
+
+  # ============================================================================
+  # TERRAFORM PLAN
+  # ============================================================================
+  plan:
+    name: 'Terraform Plan (${{ needs.setup.outputs.target-env }})'
+    runs-on: ubuntu-latest
+    needs: [setup, validate]
+    if: needs.setup.outputs.terraform-action == 'plan' || needs.setup.outputs.terraform-action == 'apply'
+    environment: terraform-plan-${{ needs.setup.outputs.target-env }}
+    outputs:
+      plan-status: ${{ steps.plan.outcome }}
+      plan-summary: ${{ steps.summary.outputs.summary }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          # Initialize Terraform with Azure backend
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ needs.setup.outputs.target-env }}.tfstate"
+          
+          # Create Terraform plan
+          terraform plan \
+            -var-file="${{ needs.setup.outputs.target-env }}.tfvars" \
+            -var="build_version=${{ needs.setup.outputs.version }}" \
+            -var="deployment_strategy=${{ needs.setup.outputs.deployment-strategy }}" \
+            -out=${{ needs.setup.outputs.target-env }}.tfplan \
+            -detailed-exitcode
+            
+      - name: Generate plan outputs
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          # Generate human-readable plan
+          terraform show ${{ needs.setup.outputs.target-env }}.tfplan > plan.txt
+          
+          # Generate JSON plan for analysis
+          terraform show -json ${{ needs.setup.outputs.target-env }}.tfplan > plan.json
+          
+      - name: Analyze Terraform Plan
+        id: analysis
+        run: |
+          pip3 install jq python-json-logger
+          
+          # Analyze Terraform plan for risks
+          python scripts/terraform_plan_analyzer.py \
+            --plan-file environments/${{ needs.setup.outputs.target-env }}/plan.json \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --generate-report
+            
+          # Check for high-risk changes
+          python scripts/infrastructure_risk_assessment.py \
+            --plan-file environments/${{ needs.setup.outputs.target-env }}/plan.json \
+            --environment ${{ needs.setup.outputs.target-env }}
+            
+      - name: Create plan summary
+        id: summary
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          # Create a summary of the plan
+          SUMMARY=$(terraform show -no-color ${{ needs.setup.outputs.target-env }}.tfplan | head -50)
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+      - name: Comment PR with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/${{ needs.setup.outputs.target-env }}/plan.txt', 'utf8');
+            
+            const output = `
+            ## Terraform Plan for ${{ needs.setup.outputs.target-env }} 🏗️
+            
+            <details>
+            <summary>Show Plan</summary>
+            
+            \`\`\`hcl
+            ${plan}
+            \`\`\`
+            
+            </details>
+            
+            **Environment:** ${{ needs.setup.outputs.target-env }}
+            **Strategy:** ${{ needs.setup.outputs.deployment-strategy }}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+            
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-${{ needs.setup.outputs.target-env }}
+          path: |
+            environments/${{ needs.setup.outputs.target-env }}/*.tfplan
+            environments/${{ needs.setup.outputs.target-env }}/plan.*
+            *-analysis-report.*
+          retention-days: 30
+
+  # ============================================================================
+  # PLAN REVIEW AND APPROVAL
+  # ============================================================================
+  approve:
+    name: 'Review & Approve Infrastructure Changes'
+    runs-on: ubuntu-latest
+    needs: [setup, plan]
+    if: |
+      needs.setup.outputs.terraform-action == 'apply' && 
+      needs.setup.outputs.target-env != 'dev' &&
+      needs.plan.outputs.plan-status == 'success'
+    environment: 
+      name: terraform-approve-${{ needs.setup.outputs.target-env }}
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Display plan summary
+        run: |
+          echo "## Terraform Plan Summary for ${{ needs.setup.outputs.target-env }}"
+          echo "${{ needs.plan.outputs.plan-summary }}"
+          
+      - name: Manual approval checkpoint
+        run: |
+          echo "✅ Infrastructure changes have been reviewed and approved"
+          echo "Environment: ${{ needs.setup.outputs.target-env }}"
+          echo "Strategy: ${{ needs.setup.outputs.deployment-strategy }}"
+          echo "Approved by: ${{ github.actor }}"
+
+  # ============================================================================
+  # INFRASTRUCTURE DEPLOYMENT
+  # ============================================================================
+  deploy:
+    name: 'Deploy Infrastructure (${{ needs.setup.outputs.deployment-strategy }})'
+    runs-on: ubuntu-latest
+    needs: [setup, plan, approve]
+    if: |
+      needs.setup.outputs.should-deploy == 'true' &&
+      (needs.setup.outputs.target-env == 'dev' || needs.approve.result == 'success')
+    environment: 
+      name: terraform-deploy-${{ needs.setup.outputs.target-env }}
+      url: https://${{ needs.setup.outputs.target-env }}.infrastructure.domain.com
+    concurrency:
+      group: terraform-deploy-${{ needs.setup.outputs.target-env }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Download plan artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan-${{ needs.setup.outputs.target-env }}
+          path: environments/${{ needs.setup.outputs.target-env }}/
+          
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          
+      - name: Pre-deployment validation
+        run: |
+          echo "🔍 Running pre-deployment infrastructure checks..."
+          
+          # Critical pre-production checks for production
+          if [[ "${{ needs.setup.outputs.target-env }}" == "production" ]]; then
+            python scripts/pre_prod_infrastructure_checks.py \
+              --check-change-window \
+              --check-maintenance-mode \
+              --check-backup-status \
+              --check-monitoring-health
+          fi
+          
+      - name: Deploy using Standard Strategy
+        if: needs.setup.outputs.deployment-strategy == 'standard'
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          echo "🏗️ Deploying infrastructure using standard strategy..."
+          
+          # Initialize Terraform
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ needs.setup.outputs.target-env }}.tfstate"
+            
+          # Apply the planned changes
+          terraform apply -auto-approve ${{ needs.setup.outputs.target-env }}.tfplan
+          
+          # Generate infrastructure outputs
+          terraform output -json > outputs.json
+          
+      - name: Deploy using Blue-Green Strategy
+        if: needs.setup.outputs.deployment-strategy == 'blue-green'
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          echo "🔵🟢 Deploying infrastructure using blue-green strategy..."
+          
+          # Initialize Terraform
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ needs.setup.outputs.target-env }}.tfstate"
+            
+          # Deploy blue infrastructure first
+          export TF_VAR_deployment_slot="blue"
+          export TF_VAR_environment="${{ needs.setup.outputs.target-env }}-blue"
+          
+          terraform apply -auto-approve ${{ needs.setup.outputs.target-env }}.tfplan
+          
+          # Wait for infrastructure to stabilize
+          sleep 120
+          
+          # Health check blue infrastructure
+          python ../../scripts/infrastructure_health_check.py \
+            --environment ${{ needs.setup.outputs.target-env }}-blue \
+            --timeout 300 \
+            --check-all
+            
+          # Switch traffic to blue infrastructure
+          az network dns record-set cname set-record \
+            --resource-group ${{ needs.setup.outputs.target-env }}-dns-rg \
+            --zone-name ${{ needs.setup.outputs.target-env }}.domain.com \
+            --record-set-name app \
+            --cname ${{ needs.setup.outputs.target-env }}-blue.domain.com
+            
+          echo "✅ Traffic switched to blue infrastructure"
+          
+          # Cleanup green infrastructure
+          python ../../scripts/infrastructure_cleanup.py \
+            --environment ${{ needs.setup.outputs.target-env }}-green \
+            --confirm-cleanup
+            
+      - name: Deploy using Canary Strategy
+        if: needs.setup.outputs.deployment-strategy == 'canary'
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          echo "🐤 Deploying infrastructure using canary strategy..."
+          
+          # Initialize Terraform
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ needs.setup.outputs.target-env }}.tfstate"
+            
+          # Canary deployment phases
+          PERCENTAGES=(20 50 100)
+          
+          for PERCENTAGE in "${PERCENTAGES[@]}"; do
+            echo "📊 Deploying canary infrastructure at ${PERCENTAGE}%..."
+            
+            export TF_VAR_canary_percentage="${PERCENTAGE}"
+            export TF_VAR_canary_deployment="true"
+            
+            # Apply infrastructure changes for this phase
+            terraform apply -auto-approve ${{ needs.setup.outputs.target-env }}.tfplan
+            
+            # Monitor canary infrastructure
+            MONITOR_DURATION=$((PERCENTAGE < 100 ? 900 : 300))
+            python ../../scripts/infrastructure_canary_monitor.py \
+              --environment ${{ needs.setup.outputs.target-env }} \
+              --canary-percentage $PERCENTAGE \
+              --duration $MONITOR_DURATION \
+              --monitor-metrics cpu,memory,network,disk \
+              --error-threshold 0.01
+              
+            # Wait before next phase (except final)
+            if [[ $PERCENTAGE -lt 100 ]]; then
+              echo "⏳ Canary at ${PERCENTAGE}% is stable. Proceeding to next phase in 60 seconds..."
+              sleep 60
+            fi
+          done
+          
+          # Generate final outputs
+          terraform output -json > outputs.json
+          
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-outputs-${{ needs.setup.outputs.target-env }}
+          path: |
+            environments/${{ needs.setup.outputs.target-env }}/outputs.json
+          retention-days: 90
+
+  # ============================================================================
+  # INFRASTRUCTURE DESTRUCTION (MANUAL ONLY)
+  # ============================================================================
+  destroy:
+    name: 'Destroy Infrastructure'
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.terraform-action == 'destroy'
+    environment: 
+      name: terraform-destroy-${{ needs.setup.outputs.target-env }}
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: ⚠️ Infrastructure Destruction Warning
+        run: |
+          echo "⚠️⚠️⚠️ WARNING: INFRASTRUCTURE DESTRUCTION ⚠️⚠️⚠️"
+          echo "Environment: ${{ needs.setup.outputs.target-env }}"
+          echo "This action will PERMANENTLY DESTROY infrastructure resources!"
+          
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          
+      - name: Destroy Infrastructure
+        working-directory: environments/${{ needs.setup.outputs.target-env }}
+        run: |
+          # Initialize Terraform
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ needs.setup.outputs.target-env }}.tfstate"
+            
+          # Destroy infrastructure
+          terraform destroy \
+            -var-file="${{ needs.setup.outputs.target-env }}.tfvars" \
+            -auto-approve
+            
+          echo "💥 Infrastructure destroyed for ${{ needs.setup.outputs.target-env }}"
+
+  # ============================================================================
+  # POST-DEPLOYMENT VALIDATION
+  # ============================================================================
+  validate-deployment:
+    name: 'Post-Deployment Validation'
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+    if: needs.deploy.result == 'success'
+    strategy:
+      matrix:
+        validation: [health, compliance, performance, security]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install validation tools
+        run: |
+          pip install azure-cli boto3 requests python-json-logger
+          
+      - name: Infrastructure Health Check
+        if: matrix.validation == 'health'
+        run: |
+          echo "🏥 Running infrastructure health checks..."
+          python scripts/infrastructure_health_check.py \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --check-connectivity \
+            --check-services \
+            --check-monitoring \
+            --check-security-groups \
+            --timeout 600
+            
+      - name: Compliance Validation
+        if: matrix.validation == 'compliance'
+        run: |
+          echo "📋 Running infrastructure compliance validation..."
+          python scripts/infrastructure_compliance_validator.py \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --frameworks CIS,NIST,ISO27001 \
+            --generate-report
+            
+      - name: Performance Baseline
+        if: matrix.validation == 'performance'
+        run: |
+          echo "📊 Establishing performance baselines..."
+          python scripts/performance_baseline.py \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --duration 300 \
+            --create-baseline \
+            --generate-report
+            
+      - name: Security Validation
+        if: matrix.validation == 'security'
+        run: |
+          echo "🔒 Running security validation..."
+          python scripts/infrastructure_security_validation.py \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --check-network-security \
+            --check-access-controls \
+            --check-encryption \
+            --generate-report
+            
+      - name: Upload validation reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: validation-${{ matrix.validation }}-${{ needs.setup.outputs.target-env }}
+          path: |
+            *-validation-report.*
+            *-compliance-report.*
+            *-baseline-report.*
+          retention-days: 90
+
+  # ============================================================================
+  # DISASTER RECOVERY TESTING (PRODUCTION ONLY)
+  # ============================================================================
+  disaster-recovery:
+    name: 'Disaster Recovery Testing'
+    runs-on: ubuntu-latest
+    needs: [setup, validate-deployment]
+    if: |
+      needs.setup.outputs.target-env == 'production' &&
+      needs.setup.outputs.terraform-action == 'apply' &&
+      github.run_number % 50 == 0
+    environment: production-dr-testing
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Disaster Recovery Tests
+        run: |
+          echo "🚨 Running disaster recovery tests..."
+          python scripts/disaster_recovery_test.py \
+            --environment production \
+            --test-backup-restore \
+            --test-failover-scenarios \
+            --validate-rto-rpo \
+            --generate-report \
+            --dry-run
+            
+      - name: Upload DR test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: disaster-recovery-test-results
+          path: |
+            dr-test-*.html
+            dr-test-*.json
+          retention-days: 365
+
+  # ============================================================================
+  # MONITORING AND ALERTING UPDATE
+  # ============================================================================
+  update-monitoring:
+    name: 'Update Infrastructure Monitoring'
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, validate-deployment]
+    if: needs.deploy.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Update monitoring dashboards
+        env:
+          GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+          GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+        run: |
+          echo "📊 Updating infrastructure monitoring dashboards..."
+          python scripts/update_infrastructure_monitoring.py \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --version ${{ needs.setup.outputs.version }} \
+            --update-dashboards \
+            --update-alerts \
+            --create-baselines
+            
+      - name: Update alerting rules
+        env:
+          PROMETHEUS_URL: ${{ secrets.PROMETHEUS_URL }}
+        run: |
+          echo "🚨 Updating infrastructure alerting rules..."
+          python scripts/update_infrastructure_alerting.py \
+            --environment ${{ needs.setup.outputs.target-env }} \
+            --version ${{ needs.setup.outputs.version }}
+
+  # ============================================================================
+  # NOTIFICATION AND REPORTING
+  # ============================================================================
+  notification:
+    name: 'Send Infrastructure Notifications'
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, validate-deployment, update-monitoring]
+    if: always()
+    steps:
+      - name: Determine notification status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" && "${{ needs.validate-deployment.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+            echo "message=🏗️ Infrastructure deployment completed successfully" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy.result }}" == "failure" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+            echo "message=❌ Infrastructure deployment failed" >> $GITHUB_OUTPUT
+          else
+            echo "status=partial" >> $GITHUB_OUTPUT
+            echo "color=warning" >> $GITHUB_OUTPUT
+            echo "message=⚠️ Infrastructure deployment completed with warnings" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ steps.status.outputs.status }}
+          channel: '#infrastructure'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          custom_payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ steps.status.outputs.message }}\n*Repository:* ${{ github.repository }}\n*Environment:* ${{ needs.setup.outputs.target-env }}\n*Version:* ${{ needs.setup.outputs.version }}\n*Action:* ${{ needs.setup.outputs.terraform-action }}\n*Strategy:* ${{ needs.setup.outputs.deployment-strategy }}"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Infrastructure Run"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+
+  # ============================================================================
+  # ROLLBACK ON FAILURE
+  # ============================================================================
+  rollback:
+    name: 'Emergency Infrastructure Rollback'
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, validate-deployment]
+    if: |
+      failure() && 
+      needs.setup.outputs.target-env == 'production' &&
+      (needs.deploy.result == 'failure' || needs.validate-deployment.result == 'failure')
+    environment: production-infrastructure-emergency
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          
+      - name: Execute emergency infrastructure rollback
+        working-directory: environments/production
+        run: |
+          echo "🚨 Executing emergency infrastructure rollback..."
+          
+          # Initialize Terraform
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=production.tfstate"
+            
+          # Get current state
+          terraform state pull > current-state.tfstate
+          
+          # Execute rollback
+          python ../../scripts/infrastructure_rollback.py \
+            --environment production \
+            --rollback-target previous-stable \
+            --emergency-mode \
+            --auto-approve
+            
+      - name: Send critical infrastructure alerts
+        run: |
+          echo "🚨 Sending critical infrastructure alerts..."
+          python scripts/infrastructure_alert_manager.py \
+            --severity critical \
+            --message "Production infrastructure rollback executed for build ${{ github.run_number }}" \
+            --notify-sre-team \
+            --create-incident \
+            --page-oncall \
+            --notify-executives

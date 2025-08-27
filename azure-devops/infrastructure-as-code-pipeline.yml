@@ -1,0 +1,629 @@
+# Azure DevOps Pipeline for Infrastructure as Code (Terraform)
+# Advanced Deployment Strategies: Blue-Green Infrastructure, Canary Infrastructure, Multi-Environment
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+  paths:
+    include:
+      - terraform/*
+      - modules/*
+      - environments/*
+    exclude:
+      - README.md
+      - docs/*
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  - group: terraform-prod-secrets
+  - group: terraform-staging-secrets
+  - name: terraformVersion
+    value: '1.5.7'
+  - name: azureServiceConnection
+    value: 'azure-terraform-sp'
+  - name: terraformBackendResourceGroup
+    value: 'terraform-state-rg'
+  - name: terraformBackendStorageAccount
+    value: 'terraformstatestorage'
+  - name: terraformBackendContainerName
+    value: 'tfstate'
+
+stages:
+  - stage: Validate
+    displayName: 'Infrastructure Validation & Security Scan'
+    jobs:
+      - job: ValidateInfrastructure
+        displayName: 'Terraform Validation & Security Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+            displayName: 'Install Terraform $(terraformVersion)'
+
+          - script: |
+              # Install additional tools
+              curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              wget https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64 -O tfsec
+              chmod +x tfsec && sudo mv tfsec /usr/local/bin/
+              
+              # Install Checkov for additional security scanning
+              pip3 install checkov
+            displayName: 'Install infrastructure scanning tools'
+
+          - script: |
+              # Terraform format validation
+              terraform fmt -check -recursive .
+            displayName: 'Terraform format validation'
+
+          - script: |
+              # Initialize Terraform for all environments
+              for env in dev staging prod; do
+                echo "Initializing Terraform for $env environment..."
+                cd environments/$env
+                terraform init -backend=false
+                terraform validate
+                cd ../../
+              done
+            displayName: 'Terraform validation for all environments'
+
+          - script: |
+              # TFLint analysis
+              tflint --init
+              find . -name "*.tf" -not -path "./.terraform/*" | xargs dirname | sort -u | while read dir; do
+                echo "Running TFLint on $dir"
+                tflint "$dir"
+              done
+            displayName: 'TFLint static analysis'
+
+          - script: |
+              # TFSec security scanning
+              tfsec . --format json --out tfsec-results.json
+              tfsec . --format junit --out tfsec-junit.xml
+            displayName: 'TFSec security scanning'
+
+          - script: |
+              # Checkov security and compliance scanning
+              checkov -d . --framework terraform --output json --output-file checkov-results.json
+              checkov -d . --framework terraform --output junitxml --output-file checkov-junit.xml
+            displayName: 'Checkov security and compliance scanning'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFiles: |
+                tfsec-junit.xml
+                checkov-junit.xml
+              testRunTitle: 'Infrastructure Security Tests'
+
+          - script: |
+              # Cost estimation using Infracost
+              curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+              for env in dev staging prod; do
+                echo "Generating cost estimate for $env environment..."
+                cd environments/$env
+                infracost breakdown --path . --format json --out-file ../../infracost-$env.json
+                cd ../../
+              done
+            displayName: 'Infrastructure cost estimation'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'infracost-*.json'
+              artifactName: 'cost-estimates'
+
+  - stage: PlanDev
+    displayName: 'Plan Development Infrastructure'
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - job: PlanDevInfrastructure
+        displayName: 'Terraform Plan - Development'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+            displayName: 'Install Terraform'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Plan - Dev Environment'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd environments/dev
+                
+                # Initialize with Azure backend
+                terraform init \
+                  -backend-config="resource_group_name=$(terraformBackendResourceGroup)" \
+                  -backend-config="storage_account_name=$(terraformBackendStorageAccount)" \
+                  -backend-config="container_name=$(terraformBackendContainerName)" \
+                  -backend-config="key=dev.tfstate"
+                
+                # Create detailed plan
+                terraform plan \
+                  -var-file="dev.tfvars" \
+                  -out=dev.tfplan \
+                  -detailed-exitcode
+                
+                # Generate plan summary
+                terraform show -json dev.tfplan > dev-plan.json
+                
+                # Generate readable plan
+                terraform show dev.tfplan > dev-plan.txt
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'environments/dev/'
+              artifactName: 'dev-terraform-plan'
+
+  - stage: DeployDev
+    displayName: 'Deploy Development Infrastructure'
+    dependsOn: PlanDev
+    condition: succeeded()
+    jobs:
+      - deployment: DeployDevInfrastructure
+        displayName: 'Apply Development Infrastructure'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'infrastructure-dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  inputs:
+                    artifactName: 'dev-terraform-plan'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                - task: AzureCLI@2
+                  displayName: 'Apply Dev Infrastructure'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(System.ArtifactsDirectory)/dev-terraform-plan
+                      
+                      # Apply the planned changes
+                      terraform apply -auto-approve dev.tfplan
+                      
+                      # Output infrastructure details
+                      terraform output -json > dev-outputs.json
+
+                - task: PublishBuildArtifacts@1
+                  inputs:
+                    pathtoPublish: '$(System.ArtifactsDirectory)/dev-terraform-plan/dev-outputs.json'
+                    artifactName: 'dev-infrastructure-outputs'
+
+  - stage: PlanStaging
+    displayName: 'Plan Staging Infrastructure'
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: PlanStagingInfrastructure
+        displayName: 'Terraform Plan - Staging'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Plan - Staging Environment'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd environments/staging
+                
+                terraform init \
+                  -backend-config="resource_group_name=$(terraformBackendResourceGroup)" \
+                  -backend-config="storage_account_name=$(terraformBackendStorageAccount)" \
+                  -backend-config="container_name=$(terraformBackendContainerName)" \
+                  -backend-config="key=staging.tfstate"
+                
+                terraform plan \
+                  -var-file="staging.tfvars" \
+                  -out=staging.tfplan \
+                  -detailed-exitcode
+                
+                terraform show -json staging.tfplan > staging-plan.json
+                terraform show staging.tfplan > staging-plan.txt
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'environments/staging/'
+              artifactName: 'staging-terraform-plan'
+
+  - stage: DeployStaging
+    displayName: 'Deploy Staging Infrastructure (Blue-Green)'
+    dependsOn: [PlanStaging, DeployDev]
+    condition: succeeded()
+    jobs:
+      - deployment: BlueGreenStagingInfrastructure
+        displayName: 'Blue-Green Infrastructure Deployment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'infrastructure-staging'
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - script: |
+                    echo "Preparing blue-green infrastructure deployment"
+                    echo "Checking current infrastructure state..."
+                  displayName: 'Pre-deployment infrastructure checks'
+                  
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  inputs:
+                    artifactName: 'staging-terraform-plan'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                # Deploy Blue Infrastructure
+                - task: AzureCLI@2
+                  displayName: 'Deploy Blue Infrastructure'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(System.ArtifactsDirectory)/staging-terraform-plan
+                      
+                      # Set blue environment variable
+                      export TF_VAR_deployment_slot="blue"
+                      export TF_VAR_environment="staging-blue"
+                      
+                      # Apply blue infrastructure
+                      terraform apply -auto-approve staging.tfplan
+                      
+                      # Wait for infrastructure to be ready
+                      sleep 120
+                      
+                      # Validate blue infrastructure
+                      terraform output -json > staging-blue-outputs.json
+
+                # Health check blue infrastructure
+                - script: |
+                    echo "Performing health checks on blue infrastructure..."
+                    python scripts/infrastructure-health-check.py \
+                      --environment staging-blue \
+                      --timeout 300 \
+                      --check-connectivity \
+                      --check-services \
+                      --check-monitoring
+                  displayName: 'Blue infrastructure health check'
+
+                # Switch DNS/Load Balancer to Blue (Blue-Green Switch)
+                - task: AzureCLI@2
+                  displayName: 'Switch traffic to Blue infrastructure'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Update DNS or load balancer configuration to point to blue
+                      az network dns record-set cname set-record \
+                        --resource-group staging-dns-rg \
+                        --zone-name staging.domain.com \
+                        --record-set-name app \
+                        --cname staging-blue.domain.com
+                      
+                      echo "Traffic switched to blue infrastructure"
+
+                # Cleanup Green Infrastructure
+                - task: AzureCLI@2
+                  displayName: 'Cleanup old Green infrastructure'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Clean up old green infrastructure
+                      cd environments/staging
+                      
+                      export TF_VAR_deployment_slot="green"
+                      export TF_VAR_environment="staging-green"
+                      
+                      # Destroy green infrastructure if it exists
+                      terraform destroy -auto-approve -var-file="staging.tfvars" || echo "No green infrastructure to destroy"
+
+            postRouteTraffic:
+              steps:
+                - task: PublishBuildArtifacts@1
+                  inputs:
+                    pathtoPublish: '$(System.ArtifactsDirectory)/staging-terraform-plan/staging-blue-outputs.json'
+                    artifactName: 'staging-infrastructure-outputs'
+
+  - stage: PlanProduction
+    displayName: 'Plan Production Infrastructure'
+    dependsOn: DeployStaging
+    condition: succeeded()
+    jobs:
+      - job: PlanProductionInfrastructure
+        displayName: 'Terraform Plan - Production'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Plan - Production Environment'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd environments/prod
+                
+                terraform init \
+                  -backend-config="resource_group_name=$(terraformBackendResourceGroup)" \
+                  -backend-config="storage_account_name=$(terraformBackendStorageAccount)" \
+                  -backend-config="container_name=$(terraformBackendContainerName)" \
+                  -backend-config="key=prod.tfstate"
+                
+                # Generate comprehensive plan
+                terraform plan \
+                  -var-file="prod.tfvars" \
+                  -out=prod.tfplan \
+                  -detailed-exitcode
+                
+                terraform show -json prod.tfplan > prod-plan.json
+                terraform show prod.tfplan > prod-plan.txt
+                
+                # Generate change summary
+                python ../../scripts/terraform-change-analyzer.py prod-plan.json
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'environments/prod/'
+              artifactName: 'prod-terraform-plan'
+
+  - stage: DeployProduction
+    displayName: 'Deploy Production Infrastructure (Canary)'
+    dependsOn: PlanProduction
+    condition: succeeded()
+    jobs:
+      - deployment: CanaryProductionInfrastructure
+        displayName: 'Canary Infrastructure Deployment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'infrastructure-production'
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - script: |
+                    # Critical pre-production infrastructure checks
+                    python scripts/pre-prod-infrastructure-checks.py \
+                      --check-change-window \
+                      --check-maintenance-mode \
+                      --check-backup-status \
+                      --check-monitoring-health
+                  displayName: 'Critical pre-production infrastructure validation'
+                  
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  inputs:
+                    artifactName: 'prod-terraform-plan'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                # Phase 1: Deploy Canary Infrastructure (20% of resources)
+                - task: AzureCLI@2
+                  displayName: 'Deploy Canary Infrastructure (Phase 1 - 20%)'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(System.ArtifactsDirectory)/prod-terraform-plan
+                      
+                      # Deploy only canary resources first
+                      export TF_VAR_canary_deployment="true"
+                      export TF_VAR_canary_percentage="20"
+                      
+                      terraform apply -auto-approve \
+                        -target=module.compute_canary \
+                        -target=module.database_read_replicas \
+                        prod.tfplan
+
+                # Monitor Canary Infrastructure - Phase 1
+                - script: |
+                    python scripts/infrastructure-canary-monitor.py \
+                      --phase 1 \
+                      --canary-percentage 20 \
+                      --duration 600 \
+                      --monitor-metrics cpu,memory,network,disk \
+                      --error-threshold 0.01 \
+                      --rollback-on-failure
+                  displayName: 'Monitor Canary Infrastructure Phase 1 (10 minutes)'
+
+                # Phase 2: Increase Canary to 50%
+                - task: AzureCLI@2
+                  displayName: 'Expand Canary Infrastructure (Phase 2 - 50%)'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(System.ArtifactsDirectory)/prod-terraform-plan
+                      
+                      export TF_VAR_canary_percentage="50"
+                      
+                      terraform apply -auto-approve \
+                        -target=module.compute_additional \
+                        -target=module.load_balancer_canary \
+                        prod.tfplan
+
+                # Monitor Canary Infrastructure - Phase 2
+                - script: |
+                    python scripts/infrastructure-canary-monitor.py \
+                      --phase 2 \
+                      --canary-percentage 50 \
+                      --duration 900 \
+                      --monitor-metrics cpu,memory,network,disk,latency \
+                      --error-threshold 0.005 \
+                      --performance-regression-check \
+                      --rollback-on-failure
+                  displayName: 'Monitor Canary Infrastructure Phase 2 (15 minutes)'
+
+                # Phase 3: Full Infrastructure Deployment
+                - task: AzureCLI@2
+                  displayName: 'Complete Infrastructure Deployment (Phase 3 - 100%)'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(System.ArtifactsDirectory)/prod-terraform-plan
+                      
+                      export TF_VAR_canary_percentage="100"
+                      export TF_VAR_canary_deployment="false"
+                      
+                      # Apply remaining infrastructure changes
+                      terraform apply -auto-approve prod.tfplan
+                      
+                      # Generate final outputs
+                      terraform output -json > prod-outputs.json
+
+            postRouteTraffic:
+              steps:
+                # Final infrastructure validation
+                - script: |
+                    python scripts/post-deployment-infrastructure-validation.py \
+                      --environment production \
+                      --full-validation \
+                      --performance-baseline \
+                      --security-validation \
+                      --compliance-check
+                  displayName: 'Comprehensive post-deployment validation'
+
+                # Update monitoring and alerting
+                - script: |
+                    python scripts/update-infrastructure-monitoring.py \
+                      --environment production \
+                      --version $(Build.BuildId) \
+                      --update-dashboards \
+                      --update-alerts \
+                      --create-baselines
+                  displayName: 'Update infrastructure monitoring'
+
+                - task: PublishBuildArtifacts@1
+                  inputs:
+                    pathtoPublish: '$(System.ArtifactsDirectory)/prod-terraform-plan/prod-outputs.json'
+                    artifactName: 'prod-infrastructure-outputs'
+
+      - job: InfrastructureRollback
+        displayName: 'Infrastructure Rollback on Failure'
+        dependsOn: CanaryProductionInfrastructure
+        condition: failed()
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Emergency infrastructure rollback'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd environments/prod
+                
+                # Initialize Terraform
+                terraform init \
+                  -backend-config="resource_group_name=$(terraformBackendResourceGroup)" \
+                  -backend-config="storage_account_name=$(terraformBackendStorageAccount)" \
+                  -backend-config="container_name=$(terraformBackendContainerName)" \
+                  -backend-config="key=prod.tfstate"
+                
+                # Get the previous stable state
+                terraform state pull > current-state.tfstate
+                
+                # Rollback to previous stable configuration
+                python ../../scripts/infrastructure-rollback.py \
+                  --environment production \
+                  --rollback-target previous-stable \
+                  --emergency-mode
+
+          - script: |
+              # Send critical infrastructure alerts
+              python scripts/infrastructure-alert-manager.py \
+                --severity critical \
+                --message "Production infrastructure rollback executed" \
+                --notify-sre-team \
+                --create-incident \
+                --page-oncall
+            displayName: 'Emergency infrastructure alerting'
+
+  - stage: PostDeploymentValidation
+    displayName: 'Post-Deployment Infrastructure Validation'
+    dependsOn: DeployProduction
+    condition: succeeded()
+    jobs:
+      - job: InfrastructureValidation
+        displayName: 'Comprehensive infrastructure validation'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              # Infrastructure compliance scanning
+              python scripts/infrastructure-compliance-scan.py \
+                --environment production \
+                --frameworks cis,nist,iso27001 \
+                --generate-report
+            displayName: 'Infrastructure compliance scanning'
+
+          - script: |
+              # Infrastructure cost analysis
+              python scripts/infrastructure-cost-analysis.py \
+                --environment production \
+                --compare-with-baseline \
+                --generate-cost-optimization-report
+            displayName: 'Infrastructure cost analysis'
+
+          - script: |
+              # Disaster recovery validation
+              python scripts/disaster-recovery-test.py \
+                --environment production \
+                --test-backup-restore \
+                --test-failover-scenarios \
+                --validate-rto-rpo
+            displayName: 'Disaster recovery validation'
+
+          - script: |
+              # Send infrastructure deployment success notifications
+              python scripts/infrastructure-notification-manager.py \
+                --event infrastructure-deployment-success \
+                --version $(Build.BuildId) \
+                --environment production \
+                --notify-channels slack,email,teams \
+                --include-infrastructure-metrics \
+                --notify-stakeholders
+            displayName: 'Infrastructure deployment success notifications'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'infrastructure-reports/'
+              artifactName: 'infrastructure-reports-$(Build.BuildId)'
