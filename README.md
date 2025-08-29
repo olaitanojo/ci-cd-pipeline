@@ -1,30 +1,123 @@
 # Enterprise CI/CD Pipeline Platform
 
+[![GitHub Actions](https://img.shields.io/badge/github%20actions-%232671E5.svg?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/features/actions)
+[![Kubernetes](https://img.shields.io/badge/kubernetes-%23326ce5.svg?style=for-the-badge&logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Terraform](https://img.shields.io/badge/terraform-%235835CC.svg?style=for-the-badge&logo=terraform&logoColor=white)](https://www.terraform.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A comprehensive, production-ready CI/CD platform demonstrating SRE best practices with advanced deployment strategies, comprehensive testing, security scanning, and reliability features.
 
 ## 🚀 Architecture Overview
 
+### System Architecture
 ```mermaid
 graph TB
-    Developer[Developer] --> Git[Git Repository]
-    Git --> Webhook[Webhook Trigger]
-    Webhook --> Pipeline[CI/CD Pipeline]
+    subgraph "Developer Experience"
+        A1[Developer]
+        A2[Git Repository]
+        A3[Pull Requests]
+        A4[Code Reviews]
+    end
     
-    Pipeline --> Build[Build Stage]
-    Pipeline --> Test[Test Stage]
-    Pipeline --> Security[Security Scan]
-    Pipeline --> Quality[Quality Gates]
+    subgraph "CI/CD Engine"
+        B1[Webhook Triggers]
+        B2[Pipeline Orchestrator]
+        B3[Build Agents]
+        B4[Artifact Registry]
+    end
     
-    Quality --> Deploy[Deployment Stage]
-    Deploy --> BlueGreen[Blue/Green Deployment]
-    Deploy --> Canary[Canary Deployment]
-    Deploy --> Rolling[Rolling Update]
+    subgraph "Quality Assurance"
+        C1[Unit Testing]
+        C2[Integration Testing]
+        C3[Security Scanning]
+        C4[Quality Gates]
+        C5[Performance Testing]
+    end
     
-    Deploy --> Monitor[Monitoring & Health Checks]
-    Monitor --> Rollback[Auto Rollback]
+    subgraph "Deployment Strategies"
+        D1[Blue-Green]
+        D2[Canary Release]
+        D3[Rolling Update]
+        D4[Feature Flags]
+    end
     
-    Pipeline --> Notify[Notifications]
-    Pipeline --> Metrics[Metrics & Analytics]
+    subgraph "Infrastructure"
+        E1[Kubernetes Clusters]
+        E2[Service Mesh]
+        E3[Load Balancers]
+        E4[Container Registry]
+    end
+    
+    subgraph "Observability"
+        F1[Monitoring]
+        F2[Logging]
+        F3[Tracing]
+        F4[Alerting]
+    end
+    
+    A1 --> A2
+    A2 --> A3
+    A3 --> B1
+    B1 --> B2
+    B2 --> B3
+    B3 --> B4
+    
+    B2 --> C1
+    C1 --> C2
+    C2 --> C3
+    C3 --> C4
+    C4 --> C5
+    
+    C5 --> D1
+    C5 --> D2
+    C5 --> D3
+    C5 --> D4
+    
+    D1 --> E1
+    D2 --> E2
+    D3 --> E3
+    D4 --> E4
+    
+    E1 --> F1
+    E2 --> F2
+    E3 --> F3
+    E4 --> F4
+```
+
+### Pipeline Flow
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant Git as Git Repository
+    participant CI as CI Pipeline
+    participant QA as Quality Gates
+    participant Deploy as Deployment
+    participant Monitor as Monitoring
+    
+    Dev->>Git: Push Code
+    Git->>CI: Trigger Webhook
+    CI->>CI: Build Application
+    CI->>CI: Run Unit Tests
+    CI->>CI: Security Scan
+    CI->>QA: Quality Check
+    QA-->>CI: Quality Results
+    
+    alt Quality Passed
+        CI->>Deploy: Start Deployment
+        Deploy->>Deploy: Blue-Green Switch
+        Deploy->>Monitor: Health Check
+        Monitor-->>Deploy: Health Status
+        
+        alt Health Good
+            Deploy-->>Dev: Deployment Success
+        else Health Bad
+            Deploy->>Deploy: Auto Rollback
+            Deploy-->>Dev: Rollback Complete
+        end
+    else Quality Failed
+        CI-->>Dev: Pipeline Failed
+    end
 ```
 
 ## 🌟 Key Features
